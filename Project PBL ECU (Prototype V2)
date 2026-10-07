@@ -1,16 +1,16 @@
 import sys
 import json
 import random
-import math
+import os
 import serial
 from serial.tools import list_ports
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, 
-    QGridLayout, QVBoxLayout, QHBoxLayout, QFrame, QProgressBar
+    QVBoxLayout, QHBoxLayout, QFrame, QProgressBar
 )
 from PyQt5.QtCore import QTimer, Qt, QRectF
-from PyQt5.QtGui import QFont, QPainter, QColor, QPen, QPainterPath
+from PyQt5.QtGui import QFont, QPainter, QColor, QPen, QPixmap
 import pyqtgraph as pg
 
 # ---------------------------------------------------------
@@ -55,67 +55,84 @@ class SemiGaugeWidget(QWidget):
         painter.drawText(QRectF(0, height/2 + 15, width, 20), Qt.AlignCenter, "KM / H")
 
 # ---------------------------------------------------------
-# Custom Widget: Visual Chassis & Sensors Vector
+# Custom Widget: Car View dengan Vertical Meters (Baterai & Suhu)
 # ---------------------------------------------------------
-class ChassisWidget(QWidget):
-    def __init__(self, parent=None):
+class CarViewWidget(QWidget):
+    def __init__(self, image_path="car_topview.png", parent=None):
         super().__init__(parent)
-        self.tpms = [33, 33, 32, 32]
-        self.door_open = False
-        self.belt_fastened = True
-        self.setMinimumSize(200, 220)
+        self.image_path = image_path
+        self.soc = 76
+        self.temp = 28
+        self.setMinimumSize(260, 220)
 
-    def update_status(self, tpms, door, belt):
-        self.tpms = tpms
-        self.door_open = door
-        self.belt_fastened = belt
+    def set_data(self, soc, temp):
+        self.soc = max(0, min(100, soc))
+        self.temp = max(0, min(100, temp))
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        cx = self.width() / 2
-        cy = self.height() / 2 + 10
+        w = self.width()
+        h = self.height()
+        cx = w / 2
 
-        # Text "FRONT"
+        # 1. Draw Mobil di Tengah
+        if os.path.exists(self.image_path):
+            pixmap = QPixmap(self.image_path)
+            scaled_pixmap = pixmap.scaledToHeight(int(h - 20), Qt.SmoothTransformation)
+            img_x = int(cx - scaled_pixmap.width() / 2)
+            img_y = int((h - scaled_pixmap.height()) / 2)
+            painter.drawPixmap(img_x, img_y, scaled_pixmap)
+        else:
+            # Fallback jika gambar tidak ditemukan
+            painter.setPen(QPen(QColor("#475569"), 2))
+            painter.drawRoundedRect(QRectF(cx - 35, h/2 - 65, 70, 130), 20, 20)
+
+        # 2. Vertical Meter Kiri: Baterai (%)
+        bar_x_left = 30
+        bar_y = 40
+        bar_w = 8
+        bar_h = h - 90
+
+        # Background Bar Baterai
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#1e293b"))
+        painter.drawRoundedRect(QRectF(bar_x_left, bar_y, bar_w, bar_h), 4, 4)
+
+        # Fill Bar Baterai
+        fill_h_bat = (self.soc / 100.0) * bar_h
+        painter.setBrush(QColor("#38bdf8"))
+        painter.drawRoundedRect(QRectF(bar_x_left, bar_y + (bar_h - fill_h_bat), bar_w, fill_h_bat), 4, 4)
+
+        # Text & Icon Baterai
         painter.setPen(QColor("#94a3b8"))
-        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        painter.drawText(QRectF(cx - 30, cy - 100, 60, 20), Qt.AlignCenter, "FRONT")
+        painter.setFont(QFont("Segoe UI", 10))
+        painter.drawText(QRectF(bar_x_left - 15, bar_y - 25, 38, 20), Qt.AlignCenter, "🔋")
+        painter.setPen(QColor("#f8fafc"))
+        painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        painter.drawText(QRectF(bar_x_left - 20, bar_y + bar_h + 10, 48, 20), Qt.AlignCenter, f"{self.soc}%")
 
-        # Body Mobil (Chassis Outline)
-        body_rect = QRectF(cx - 40, cy - 75, 80, 150)
-        pen_body = QPen(QColor("#475569"), 2)
-        painter.setPen(pen_body)
-        painter.drawRoundedRect(body_rect, 25, 25)
+        # 3. Vertical Meter Kanan: Suhu (°C)
+        bar_x_right = w - 38
 
-        # Pintu / Door Indicators (Garis Samping)
-        door_color = QColor("#ef4444") if self.door_open else QColor("#10b981")
-        pen_door = QPen(door_color, 4)
-        painter.setPen(pen_door)
-        painter.drawLine(int(cx - 40), int(cy - 35), int(cx - 40), int(cy + 25))
-        painter.drawLine(int(cx + 40), int(cy - 35), int(cx + 40), int(cy + 25))
+        # Background Bar Suhu
+        painter.setBrush(QColor("#1e293b"))
+        painter.drawRoundedRect(QRectF(bar_x_right, bar_y, bar_w, bar_h), 4, 4)
 
-        # Ban (4 Wheels / TPMS Indicators)
-        wheels = [
-            (cx - 55, cy - 60), # FL
-            (cx + 43, cy - 60), # FR
-            (cx - 55, cy + 35), # RL
-            (cx + 43, cy + 35)  # RR
-        ]
+        # Fill Bar Suhu
+        fill_h_temp = (self.temp / 60.0) * bar_h
+        painter.setBrush(QColor("#38bdf8"))
+        painter.drawRoundedRect(QRectF(bar_x_right, bar_y + (bar_h - fill_h_temp), bar_w, fill_h_temp), 4, 4)
 
-        for i, (wx, wy) in enumerate(wheels):
-            psi = self.tpms[i]
-            wheel_color = QColor("#10b981") if 30 <= psi <= 36 else QColor("#ef4444")
-            painter.setBrush(wheel_color)
-            painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(QRectF(wx, wy, 12, 25), 4, 4)
-
-        # Indikator Keamanan Interior / Sabuk
-        belt_color = QColor("#10b981") if self.belt_fastened else QColor("#ef4444")
-        painter.setBrush(belt_color)
-        painter.drawEllipse(int(cx - 15), int(cy - 20), 10, 10)
-        painter.drawEllipse(int(cx + 5), int(cy - 20), 10, 10)
+        # Text & Icon Suhu
+        painter.setPen(QColor("#94a3b8"))
+        painter.setFont(QFont("Segoe UI", 10))
+        painter.drawText(QRectF(bar_x_right - 15, bar_y - 25, 38, 20), Qt.AlignCenter, "🌡️")
+        painter.setPen(QColor("#f8fafc"))
+        painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        painter.drawText(QRectF(bar_x_right - 20, bar_y + bar_h + 10, 48, 20), Qt.AlignCenter, f"{int(self.temp)}°C")
 
 # ---------------------------------------------------------
 # Main Application Window
@@ -156,7 +173,7 @@ class EVDashboard(QMainWindow):
         main_layout = QVBoxLayout(main_widget)
         main_layout.setSpacing(12)
 
-        # 1. Header Bar
+        # Header Bar
         header = QHBoxLayout()
         title = QLabel("STM32 EV Telemetry  <span style='color: #10b981;'>● LIVE (2 Hz)</span>")
         title.setFont(QFont("Segoe UI", 14, QFont.Bold))
@@ -171,10 +188,10 @@ class EVDashboard(QMainWindow):
         header.addStretch()
         main_layout.addLayout(header)
 
-        # 2. Top Section: VSS Gauge & Chassis Side-by-Side
+        # Top Section: VSS Gauge & Car View
         top_grid = QHBoxLayout()
 
-        # Box Kiri: Vehicle Speed & Power
+        # Box Kiri: Speed & Power
         vss_box = QFrame()
         vss_box.setStyleSheet("background-color: #111827; border: 1px solid #1f293d; border-radius: 12px; padding: 10px;")
         vss_layout = QVBoxLayout(vss_box)
@@ -207,35 +224,28 @@ class EVDashboard(QMainWindow):
         vss_layout.addLayout(pwr_layout)
         vss_layout.addWidget(self.pwr_bar)
 
-        # Box Kanan: Chassis & Sensors
-        chassis_box = QFrame()
-        chassis_box.setStyleSheet("background-color: #111827; border: 1px solid #1f293d; border-radius: 12px; padding: 10px;")
-        chassis_layout = QVBoxLayout(chassis_box)
+        # Box Kanan: Vehicle Status (Car Graphic)
+        car_box = QFrame()
+        car_box.setStyleSheet("background-color: #111827; border: 1px solid #1f293d; border-radius: 12px; padding: 10px;")
+        car_layout = QVBoxLayout(car_box)
 
-        chassis_header = QHBoxLayout()
-        lbl_chassis_title = QLabel("Chassis & Sensors")
-        lbl_chassis_title.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: bold;")
-        lbl_hover = QLabel("Hover node for info")
-        lbl_hover.setStyleSheet("color: #475569; font-size: 10px; font-style: italic;")
-        chassis_header.addWidget(lbl_chassis_title)
-        chassis_header.addStretch()
-        chassis_header.addWidget(lbl_hover)
+        lbl_car_title = QLabel("Vehicle Status")
+        lbl_car_title.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: bold;")
 
-        self.chassis_widget = ChassisWidget()
+        self.car_widget = CarViewWidget(image_path="car_topview.png.jfif")
 
-        chassis_layout.addLayout(chassis_header)
-        chassis_layout.addWidget(self.chassis_widget)
+        car_layout.addWidget(lbl_car_title)
+        car_layout.addWidget(self.car_widget)
 
         top_grid.addWidget(vss_box, stretch=1)
-        top_grid.addWidget(chassis_box, stretch=1)
+        top_grid.addWidget(car_box, stretch=1)
         main_layout.addLayout(top_grid)
 
-        # 3. Middle Section: Battery (Level %, Mode, V/A), Temp, O2 Lambda
+        # Middle Section: Battery, Temp, O2 Lambda Cards
         mid_grid = QHBoxLayout()
 
-        # Custom Card untuk Battery Pack + Status Charging & Level %
         self.card_bat_frame, self.lbl_bat_badge, self.lbl_bat_main, self.lbl_bat_sub, self.bat_progress = self.create_battery_card()
-        self.card_temp_frame, self.lbl_temp_val = self.create_compact_card("Ambient Temp", "31.2 °C", "#38bdf8", "NORMAL")
+        self.card_temp_frame, self.lbl_temp_val = self.create_compact_card("Ambient Temp", "28.0 °C", "#38bdf8", "NORMAL")
         self.card_o2_frame, self.lbl_o2_val = self.create_compact_card("O2 Lambda Ratio", "1.02 λ", "#a855f7", "STOICH")
 
         mid_grid.addWidget(self.card_bat_frame, stretch=2)
@@ -243,7 +253,7 @@ class EVDashboard(QMainWindow):
         mid_grid.addWidget(self.card_o2_frame, stretch=1)
         main_layout.addLayout(mid_grid)
 
-        # 4. Bottom Section: Live Telemetry Graph
+        # Bottom Section: Graph
         pg.setConfigOption('background', '#111827')
         pg.setConfigOption('foreground', '#64748b')
 
@@ -273,7 +283,7 @@ class EVDashboard(QMainWindow):
         top_h.addWidget(lbl_badge)
 
         val_layout = QHBoxLayout()
-        lbl_main = QLabel("85%")
+        lbl_main = QLabel("76%")
         lbl_main.setStyleSheet("color: #10b981; font-size: 22px; font-weight: bold;")
         
         lbl_sub = QLabel("76.7 V | 26.8 A")
@@ -283,15 +293,14 @@ class EVDashboard(QMainWindow):
         val_layout.addStretch()
         val_layout.addWidget(lbl_sub)
 
-        # Bar Persentase Baterai
         progress = QProgressBar()
         progress.setMaximum(100)
-        progress.setValue(85)
+        progress.setValue(76)
         progress.setTextVisible(False)
         progress.setFixedHeight(6)
         progress.setStyleSheet("""
             QProgressBar { background-color: #1e293b; border-radius: 3px; }
-            QProgressBar::chunk { background-color: #10b981; border-radius: 3px; }
+            QProgressBar::chunk { background-color: #38bdf8; border-radius: 3px; }
         """)
 
         layout.addLayout(top_h)
@@ -333,28 +342,24 @@ class EVDashboard(QMainWindow):
         if not data:
             speed = round(random.uniform(0.0, 75.0), 1)
             voltage = round(random.uniform(74.0, 78.0), 1)
-            current = round(random.uniform(-15.0, 35.0), 1) # Arus negatif = Charging
+            current = round(random.uniform(-15.0, 35.0), 1)
             power = round((voltage * abs(current)) / 1000.0, 2)
-            
-            # Hitung SOC / Persentase Baterai berbasis Tegangan (Nominal 72V, Min 60V, Max 84V)
             soc = int(max(0, min(100, ((voltage - 60.0) / (84.0 - 60.0)) * 100)))
+            temp = round(random.uniform(27.0, 31.0), 1)
             
-            # Penentuan Mode Status Baterai
             if current < -0.5:
                 status_mode = "CHARGING ⚡"
-                mode_color = "#38bdf8" # Biru
+                mode_color = "#38bdf8"
             elif current > 0.5 and speed > 0:
                 status_mode = "DISCHARGING ⚡"
-                mode_color = "#f59e0b" # Oranye
+                mode_color = "#f59e0b"
             else:
                 status_mode = "STANDBY"
-                mode_color = "#10b981" # Hijau
+                mode_color = "#10b981"
 
             data = {
                 "speed": speed, "voltage": voltage, "current": current, "power": power,
-                "soc": soc, "mode": status_mode, "mode_color": mode_color,
-                "temp": round(random.uniform(29.0, 33.0), 1),
-                "tpms": [33, 33, 32, 32], "door": False, "belt": True,
+                "soc": soc, "temp": temp, "mode": status_mode, "mode_color": mode_color,
                 "o2": round(random.uniform(0.99, 1.03), 2)
             }
 
@@ -364,11 +369,11 @@ class EVDashboard(QMainWindow):
         self.lbl_pwr_val.setText(f"{pwr} kW")
         self.pwr_bar.setValue(int(min(100, (pwr / 5.0) * 100)))
 
-        # Update Chassis Widget
-        self.chassis_widget.update_status(data.get('tpms', [33, 33, 32, 32]), data.get('door', False), data.get('belt', True))
+        # Update Car View Widget (Gambar & Meter Vertikal)
+        self.car_widget.set_data(data.get('soc', 76), data.get('temp', 28))
 
-        # Update Kartu Baterai (Persentase SOC & Mode)
-        soc_val = data.get('soc', 80)
+        # Update Cards
+        soc_val = data.get('soc', 76)
         mode_txt = data.get('mode', 'STANDBY')
         mode_color = data.get('mode_color', '#10b981')
 
@@ -376,16 +381,9 @@ class EVDashboard(QMainWindow):
         self.lbl_bat_sub.setText(f"{data.get('voltage', 0)} V | {abs(data.get('current', 0))} A")
         self.lbl_bat_badge.setText(mode_txt)
         self.lbl_bat_badge.setStyleSheet(f"color: {mode_color}; font-size: 9px; font-weight: bold; background-color: #0f172a; padding: 2px 6px; border-radius: 4px;")
-        
         self.bat_progress.setValue(soc_val)
-        bar_color = "#ef4444" if soc_val <= 20 else ("#38bdf8" if "CHARGING" in mode_txt else "#10b981")
-        self.bat_progress.setStyleSheet(f"""
-            QProgressBar {{ background-color: #1e293b; border-radius: 3px; }}
-            QProgressBar::chunk {{ background-color: {bar_color}; border-radius: 3px; }}
-        """)
 
-        # Update Cards Lainnya
-        self.lbl_temp_val.setText(f"{data.get('temp', 0)} °C")
+        self.lbl_temp_val.setText(f"{data.get('temp', 28)} °C")
         self.lbl_o2_val.setText(f"{data.get('o2', 1.0)} λ")
 
         # Update Graph History
