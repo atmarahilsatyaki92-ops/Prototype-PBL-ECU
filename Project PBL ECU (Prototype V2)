@@ -1,0 +1,405 @@
+import sys
+import json
+import random
+import math
+import serial
+from serial.tools import list_ports
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, 
+    QGridLayout, QVBoxLayout, QHBoxLayout, QFrame, QProgressBar
+)
+from PyQt5.QtCore import QTimer, Qt, QRectF
+from PyQt5.QtGui import QFont, QPainter, QColor, QPen, QPainterPath
+import pyqtgraph as pg
+
+# ---------------------------------------------------------
+# Custom Widget: Speedometer Semi-Gauge (Melengkung)
+# ---------------------------------------------------------
+class SemiGaugeWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.value = 0  # Speed (km/h)
+        self.setMinimumSize(200, 160)
+
+    def set_value(self, val):
+        self.value = max(0, min(180, val))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+        rect = QRectF(20, 20, width - 40, width - 40)
+
+        # Draw Background Arc
+        pen_bg = QPen(QColor("#334155"), 16, Qt.SolidLine, Qt.RoundCap)
+        painter.setPen(pen_bg)
+        painter.drawArc(rect, 30 * 16, 120 * 16)
+
+        # Draw Active Value Arc
+        angle_span = int(-120 * (self.value / 120.0) * 16)
+        pen_val = QPen(QColor("#38bdf8"), 16, Qt.SolidLine, Qt.RoundCap)
+        painter.setPen(pen_val)
+        painter.drawArc(rect, 150 * 16, angle_span)
+
+        # Draw Text Speed
+        painter.setPen(QColor("#f8fafc"))
+        painter.setFont(QFont("Segoe UI", 28, QFont.Bold))
+        painter.drawText(QRectF(0, height/2 - 25, width, 40), Qt.AlignCenter, f"{int(self.value)}")
+
+        painter.setPen(QColor("#94a3b8"))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        painter.drawText(QRectF(0, height/2 + 15, width, 20), Qt.AlignCenter, "KM / H")
+
+# ---------------------------------------------------------
+# Custom Widget: Visual Chassis & Sensors Vector
+# ---------------------------------------------------------
+class ChassisWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.tpms = [33, 33, 32, 32]
+        self.door_open = False
+        self.belt_fastened = True
+        self.setMinimumSize(200, 220)
+
+    def update_status(self, tpms, door, belt):
+        self.tpms = tpms
+        self.door_open = door
+        self.belt_fastened = belt
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        cx = self.width() / 2
+        cy = self.height() / 2 + 10
+
+        # Text "FRONT"
+        painter.setPen(QColor("#94a3b8"))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        painter.drawText(QRectF(cx - 30, cy - 100, 60, 20), Qt.AlignCenter, "FRONT")
+
+        # Body Mobil (Chassis Outline)
+        body_rect = QRectF(cx - 40, cy - 75, 80, 150)
+        pen_body = QPen(QColor("#475569"), 2)
+        painter.setPen(pen_body)
+        painter.drawRoundedRect(body_rect, 25, 25)
+
+        # Pintu / Door Indicators (Garis Samping)
+        door_color = QColor("#ef4444") if self.door_open else QColor("#10b981")
+        pen_door = QPen(door_color, 4)
+        painter.setPen(pen_door)
+        painter.drawLine(int(cx - 40), int(cy - 35), int(cx - 40), int(cy + 25))
+        painter.drawLine(int(cx + 40), int(cy - 35), int(cx + 40), int(cy + 25))
+
+        # Ban (4 Wheels / TPMS Indicators)
+        wheels = [
+            (cx - 55, cy - 60), # FL
+            (cx + 43, cy - 60), # FR
+            (cx - 55, cy + 35), # RL
+            (cx + 43, cy + 35)  # RR
+        ]
+
+        for i, (wx, wy) in enumerate(wheels):
+            psi = self.tpms[i]
+            wheel_color = QColor("#10b981") if 30 <= psi <= 36 else QColor("#ef4444")
+            painter.setBrush(wheel_color)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(QRectF(wx, wy, 12, 25), 4, 4)
+
+        # Indikator Keamanan Interior / Sabuk
+        belt_color = QColor("#10b981") if self.belt_fastened else QColor("#ef4444")
+        painter.setBrush(belt_color)
+        painter.drawEllipse(int(cx - 15), int(cy - 20), 10, 10)
+        painter.drawEllipse(int(cx + 5), int(cy - 20), 10, 10)
+
+# ---------------------------------------------------------
+# Main Application Window
+# ---------------------------------------------------------
+class EVDashboard(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("STM32 EV Telemetry Monitoring System")
+        self.resize(1050, 820)
+        self.setStyleSheet("background-color: #090d16; color: #f8fafc;")
+
+        self.ser = None
+        self.init_serial()
+
+        self.power_history = []
+        self.current_history = []
+
+        self.init_ui()
+
+        self.timer = QTimer()
+        self.timer.setInterval(100)
+        self.timer.timeout.connect(self.update_telemetry)
+        self.timer.start()
+
+    def init_serial(self):
+        ports = list(list_ports.comports())
+        for p in ports:
+            if any(k in p.description for k in ["STM", "CH340", "CP210"]):
+                try:
+                    self.ser = serial.Serial(p.device, 115200, timeout=0.1)
+                    break
+                except Exception:
+                    pass
+
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setSpacing(12)
+
+        # 1. Header Bar
+        header = QHBoxLayout()
+        title = QLabel("STM32 EV Telemetry  <span style='color: #10b981;'>● LIVE (2 Hz)</span>")
+        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        subtitle = QLabel("CAN Bus Stream • Microcontroller STM32F4 ECU Node")
+        subtitle.setStyleSheet("color: #64748b; font-size: 11px;")
+        
+        v_title = QVBoxLayout()
+        v_title.addWidget(title)
+        v_title.addWidget(subtitle)
+
+        header.addLayout(v_title)
+        header.addStretch()
+        main_layout.addLayout(header)
+
+        # 2. Top Section: VSS Gauge & Chassis Side-by-Side
+        top_grid = QHBoxLayout()
+
+        # Box Kiri: Vehicle Speed & Power
+        vss_box = QFrame()
+        vss_box.setStyleSheet("background-color: #111827; border: 1px solid #1f293d; border-radius: 12px; padding: 10px;")
+        vss_layout = QVBoxLayout(vss_box)
+        
+        lbl_vss_title = QLabel("Vehicle Speed & Power")
+        lbl_vss_title.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: bold;")
+        
+        self.gauge_widget = SemiGaugeWidget()
+        
+        pwr_layout = QHBoxLayout()
+        lbl_pwr_desc = QLabel("Instant Power Draw")
+        lbl_pwr_desc.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.lbl_pwr_val = QLabel("0.00 kW")
+        self.lbl_pwr_val.setStyleSheet("color: #f8fafc; font-size: 12px; font-weight: bold;")
+        pwr_layout.addWidget(lbl_pwr_desc)
+        pwr_layout.addStretch()
+        pwr_layout.addWidget(self.lbl_pwr_val)
+
+        self.pwr_bar = QProgressBar()
+        self.pwr_bar.setMaximum(100)
+        self.pwr_bar.setTextVisible(False)
+        self.pwr_bar.setFixedHeight(8)
+        self.pwr_bar.setStyleSheet("""
+            QProgressBar { background-color: #1e293b; border-radius: 4px; }
+            QProgressBar::chunk { background-color: #38bdf8; border-radius: 4px; }
+        """)
+
+        vss_layout.addWidget(lbl_vss_title)
+        vss_layout.addWidget(self.gauge_widget)
+        vss_layout.addLayout(pwr_layout)
+        vss_layout.addWidget(self.pwr_bar)
+
+        # Box Kanan: Chassis & Sensors
+        chassis_box = QFrame()
+        chassis_box.setStyleSheet("background-color: #111827; border: 1px solid #1f293d; border-radius: 12px; padding: 10px;")
+        chassis_layout = QVBoxLayout(chassis_box)
+
+        chassis_header = QHBoxLayout()
+        lbl_chassis_title = QLabel("Chassis & Sensors")
+        lbl_chassis_title.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: bold;")
+        lbl_hover = QLabel("Hover node for info")
+        lbl_hover.setStyleSheet("color: #475569; font-size: 10px; font-style: italic;")
+        chassis_header.addWidget(lbl_chassis_title)
+        chassis_header.addStretch()
+        chassis_header.addWidget(lbl_hover)
+
+        self.chassis_widget = ChassisWidget()
+
+        chassis_layout.addLayout(chassis_header)
+        chassis_layout.addWidget(self.chassis_widget)
+
+        top_grid.addWidget(vss_box, stretch=1)
+        top_grid.addWidget(chassis_box, stretch=1)
+        main_layout.addLayout(top_grid)
+
+        # 3. Middle Section: Battery (Level %, Mode, V/A), Temp, O2 Lambda
+        mid_grid = QHBoxLayout()
+
+        # Custom Card untuk Battery Pack + Status Charging & Level %
+        self.card_bat_frame, self.lbl_bat_badge, self.lbl_bat_main, self.lbl_bat_sub, self.bat_progress = self.create_battery_card()
+        self.card_temp_frame, self.lbl_temp_val = self.create_compact_card("Ambient Temp", "31.2 °C", "#38bdf8", "NORMAL")
+        self.card_o2_frame, self.lbl_o2_val = self.create_compact_card("O2 Lambda Ratio", "1.02 λ", "#a855f7", "STOICH")
+
+        mid_grid.addWidget(self.card_bat_frame, stretch=2)
+        mid_grid.addWidget(self.card_temp_frame, stretch=1)
+        mid_grid.addWidget(self.card_o2_frame, stretch=1)
+        main_layout.addLayout(mid_grid)
+
+        # 4. Bottom Section: Live Telemetry Graph
+        pg.setConfigOption('background', '#111827')
+        pg.setConfigOption('foreground', '#64748b')
+
+        self.graph_widget = pg.PlotWidget()
+        self.graph_widget.setTitle("Live Telemetry History (Power Draw & Battery Current)", color="#94a3b8", size="9pt")
+        self.graph_widget.showGrid(x=True, y=True, alpha=0.2)
+        
+        self.curve_pwr = self.graph_widget.plot(pen=pg.mkPen(color="#38bdf8", width=2))
+        self.curve_curr = self.graph_widget.plot(pen=pg.mkPen(color="#818cf8", width=2, style=Qt.DashLine))
+
+        main_layout.addWidget(self.graph_widget, stretch=2)
+
+    def create_battery_card(self):
+        card = QFrame()
+        card.setStyleSheet("background-color: #111827; border: 1px solid #1f293d; border-radius: 10px; padding: 10px;")
+        layout = QVBoxLayout(card)
+
+        top_h = QHBoxLayout()
+        lbl_t = QLabel("Battery Pack")
+        lbl_t.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
+        
+        lbl_badge = QLabel("DISCHARGING")
+        lbl_badge.setStyleSheet("color: #f59e0b; font-size: 9px; font-weight: bold; background-color: #0f172a; padding: 2px 6px; border-radius: 4px;")
+        
+        top_h.addWidget(lbl_t)
+        top_h.addStretch()
+        top_h.addWidget(lbl_badge)
+
+        val_layout = QHBoxLayout()
+        lbl_main = QLabel("85%")
+        lbl_main.setStyleSheet("color: #10b981; font-size: 22px; font-weight: bold;")
+        
+        lbl_sub = QLabel("76.7 V | 26.8 A")
+        lbl_sub.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: bold;")
+        
+        val_layout.addWidget(lbl_main)
+        val_layout.addStretch()
+        val_layout.addWidget(lbl_sub)
+
+        # Bar Persentase Baterai
+        progress = QProgressBar()
+        progress.setMaximum(100)
+        progress.setValue(85)
+        progress.setTextVisible(False)
+        progress.setFixedHeight(6)
+        progress.setStyleSheet("""
+            QProgressBar { background-color: #1e293b; border-radius: 3px; }
+            QProgressBar::chunk { background-color: #10b981; border-radius: 3px; }
+        """)
+
+        layout.addLayout(top_h)
+        layout.addLayout(val_layout)
+        layout.addWidget(progress)
+
+        return card, lbl_badge, lbl_main, lbl_sub, progress
+
+    def create_compact_card(self, title, val, color, badge_txt):
+        card = QFrame()
+        card.setStyleSheet("background-color: #111827; border: 1px solid #1f293d; border-radius: 10px; padding: 10px;")
+        layout = QVBoxLayout(card)
+
+        top_h = QHBoxLayout()
+        lbl_t = QLabel(title)
+        lbl_t.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
+        lbl_b = QLabel(badge_txt)
+        lbl_b.setStyleSheet(f"color: {color}; font-size: 9px; font-weight: bold; background-color: #0f172a; padding: 2px 6px; border-radius: 4px;")
+        top_h.addWidget(lbl_t)
+        top_h.addStretch()
+        top_h.addWidget(lbl_b)
+
+        lbl_v = QLabel(val)
+        lbl_v.setStyleSheet("color: #f8fafc; font-size: 20px; font-weight: bold;")
+
+        layout.addLayout(top_h)
+        layout.addWidget(lbl_v)
+        return card, lbl_v
+
+    def update_telemetry(self):
+        data = None
+        if self.ser and self.ser.in_waiting:
+            try:
+                line = self.ser.readline().decode('utf-8').strip()
+                data = json.loads(line)
+            except Exception:
+                pass
+
+        if not data:
+            speed = round(random.uniform(0.0, 75.0), 1)
+            voltage = round(random.uniform(74.0, 78.0), 1)
+            current = round(random.uniform(-15.0, 35.0), 1) # Arus negatif = Charging
+            power = round((voltage * abs(current)) / 1000.0, 2)
+            
+            # Hitung SOC / Persentase Baterai berbasis Tegangan (Nominal 72V, Min 60V, Max 84V)
+            soc = int(max(0, min(100, ((voltage - 60.0) / (84.0 - 60.0)) * 100)))
+            
+            # Penentuan Mode Status Baterai
+            if current < -0.5:
+                status_mode = "CHARGING ⚡"
+                mode_color = "#38bdf8" # Biru
+            elif current > 0.5 and speed > 0:
+                status_mode = "DISCHARGING ⚡"
+                mode_color = "#f59e0b" # Oranye
+            else:
+                status_mode = "STANDBY"
+                mode_color = "#10b981" # Hijau
+
+            data = {
+                "speed": speed, "voltage": voltage, "current": current, "power": power,
+                "soc": soc, "mode": status_mode, "mode_color": mode_color,
+                "temp": round(random.uniform(29.0, 33.0), 1),
+                "tpms": [33, 33, 32, 32], "door": False, "belt": True,
+                "o2": round(random.uniform(0.99, 1.03), 2)
+            }
+
+        # Update VSS Gauge & Power
+        self.gauge_widget.set_value(data.get('speed', 0))
+        pwr = data.get('power', 0.0)
+        self.lbl_pwr_val.setText(f"{pwr} kW")
+        self.pwr_bar.setValue(int(min(100, (pwr / 5.0) * 100)))
+
+        # Update Chassis Widget
+        self.chassis_widget.update_status(data.get('tpms', [33, 33, 32, 32]), data.get('door', False), data.get('belt', True))
+
+        # Update Kartu Baterai (Persentase SOC & Mode)
+        soc_val = data.get('soc', 80)
+        mode_txt = data.get('mode', 'STANDBY')
+        mode_color = data.get('mode_color', '#10b981')
+
+        self.lbl_bat_main.setText(f"{soc_val}%")
+        self.lbl_bat_sub.setText(f"{data.get('voltage', 0)} V | {abs(data.get('current', 0))} A")
+        self.lbl_bat_badge.setText(mode_txt)
+        self.lbl_bat_badge.setStyleSheet(f"color: {mode_color}; font-size: 9px; font-weight: bold; background-color: #0f172a; padding: 2px 6px; border-radius: 4px;")
+        
+        self.bat_progress.setValue(soc_val)
+        bar_color = "#ef4444" if soc_val <= 20 else ("#38bdf8" if "CHARGING" in mode_txt else "#10b981")
+        self.bat_progress.setStyleSheet(f"""
+            QProgressBar {{ background-color: #1e293b; border-radius: 3px; }}
+            QProgressBar::chunk {{ background-color: {bar_color}; border-radius: 3px; }}
+        """)
+
+        # Update Cards Lainnya
+        self.lbl_temp_val.setText(f"{data.get('temp', 0)} °C")
+        self.lbl_o2_val.setText(f"{data.get('o2', 1.0)} λ")
+
+        # Update Graph History
+        self.power_history.append(pwr)
+        self.current_history.append(abs(data.get('current', 0)))
+        if len(self.power_history) > 40:
+            self.power_history.pop(0)
+            self.current_history.pop(0)
+
+        self.curve_pwr.setData(self.power_history)
+        self.curve_curr.setData(self.current_history)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = EVDashboard()
+    window.show()
+    sys.exit(app.exec_())
