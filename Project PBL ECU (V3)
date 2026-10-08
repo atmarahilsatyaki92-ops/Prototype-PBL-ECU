@@ -44,13 +44,22 @@ ZONE_WARN = 120            # km/h
 ZONE_RED = 150             # km/h
 TIRE_MIN, TIRE_MAX = 30, 36   # PSI normal
 POWER_LOW, POWER_HIGH = 2.5, 4.0   # kW
+FUEL_CAPACITY_LITERS = 45.0        # Kapasitas maksimal tangki bensin (Liter)
 
 GREEN, AMBER, RED, CYAN, GRAY = "#22c55e", "#f59e0b", "#ef4444", "#38bdf8", "#94a3b8"
 
-MODE_ENERGY_INFO = {
-    "CHARGING": ("Mengisi Daya (Charging)", CYAN, "Baterai sedang terisi listrik"),
-    "DISCHARGING": ("Pengosongan (Uncharging)", AMBER, "Baterai menyuplai daya kendaraan"),
-    "STANDBY": ("Siaga (Standby)", GREEN, "Sistem baterai diam"),
+# 1. Mode Energi Standar (Mode EV)
+MODE_ENERGY_EV = {
+    "CHARGING": ("Charging ⚡", CYAN, "Baterai sedang diisi daya"),
+    "DISCHARGING": ("Discharging ⚡", AMBER, "Baterai menyuplai daya kendaraan"),
+    "IDLE": ("Idle 💤", GREEN, "Baterai dalam posisi siaga / tanpa beban"),
+}
+
+# 2. Mode Energi Khusus saat Mesin Bensin Aktif (ICE / Hybrid Engine Mode)
+MODE_ENERGY_ICE = {
+    "SELF_CHARGING": ("Pengisian Ulang (Self-Charging)", CYAN, "Mesin memutar generator mengisi baterai (<20%)"),
+    "BATTERY_HOLD": ("Standby / Pemeliharaan Daya", GREEN, "Baterai menyuplai sistem pembantu (AC, Lampu, Audio)"),
+    "REGENERATIVE_READY": ("Menunggu Regeneratif", AMBER, "Siap menerima energi dari regenerative braking"),
 }
 
 DRIVE_MODES = {
@@ -66,11 +75,11 @@ BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
 
 DEFAULT_RAW = {
     "speed": 0.0, "voltage": 77.0, "current": 0.0, "temp": 28.0,
+    "fuel_level": 85.0,  # Persentase bensin (%)
     "tpms": [33, 33, 32, 32], "tpms_temp": [30, 30, 29, 29],
-    "door": False, "belt": True, "drive_mode": "EV"
+    "door": False, "belt": True, "drive_mode": "EV", "accel_state": "DECEL"
 }
 
-# PIN Default untuk Akses Manual
 VALID_PINS = ["1234", "3112301001", "2026"]
 
 
@@ -140,12 +149,20 @@ def make_logo(name, size, white_bg, fallback_text):
     return lbl
 
 
-def derive_energy_mode(current, speed):
-    if current < -0.5:
-        return "CHARGING"
-    if current > 0.5 or speed > 0:
-        return "DISCHARGING"
-    return "STANDBY"
+def derive_energy_mode(current, speed, drive_mode, soc, accel_state="HOLD"):
+    if drive_mode == "ICE":
+        if soc < 20:
+            return "SELF_CHARGING"
+        elif accel_state == "DECEL":
+            return "REGENERATIVE_READY"
+        else:
+            return "BATTERY_HOLD"
+    else:
+        if current < -0.5:
+            return "CHARGING"
+        if current > 0.5 or speed > 0:
+            return "DISCHARGING"
+        return "IDLE"
 
 
 def build_view(raw):
@@ -153,9 +170,14 @@ def build_view(raw):
     v = float(d.get("voltage", 0))
     i = float(d.get("current", 0))
     spd = float(d.get("speed", 0))
+    dm = d.get("drive_mode", "EV")
+    soc = int(max(0, min(100, (v - 60.0) / (84.0 - 60.0) * 100)))
+    accel = d.get("accel_state", "HOLD")
+
     d.setdefault("power", round(v * abs(i) / 1000.0, 2))
-    d.setdefault("soc", int(max(0, min(100, (v - 60.0) / (84.0 - 60.0) * 100))))
-    d["energy_mode"] = derive_energy_mode(i, spd)
+    d["soc"] = soc
+    d["fuel"] = float(d.get("fuel_level", 85.0))
+    d["energy_mode"] = derive_energy_mode(i, spd, dm, soc, accel)
     return d
 
 
@@ -167,6 +189,7 @@ class Simulator:
         self.speed = 0.0
         self.target = 0.0
         self.temp = 29.0
+        self.fuel = 85.0
         self.tick = 0
         self.drive_mode = "EV"
 
@@ -174,21 +197,34 @@ class Simulator:
         self.tick += 1
         if self.tick % 60 == 1:
             self.target = random.choice([0.0, random.uniform(20, 85)])
-        accel = max(-1.5, min(0.8, (self.target - self.speed) * 0.1))
-        self.speed = max(0.0, self.speed + accel)
         
-        # Pengaruh mode berkendara ke beban arus listrik
+        accel_val = (self.target - self.speed) * 0.1
+        accel_val = max(-1.5, min(0.8, accel_val))
+        accel_state = "ACCEL" if accel_val > 0.1 else ("DECEL" if accel_val < -0.1 else "HOLD")
+        
+        self.speed = max(0.0, self.speed + accel_val)
+        
         mult = 1.0 if self.drive_mode == "EV" else (0.4 if self.drive_mode == "HYBRID" else 0.05)
-        current = (self.speed * 0.3 + accel * 6 + random.uniform(-0.3, 0.3)) * mult
+        current = (self.speed * 0.3 + accel_val * 6 + random.uniform(-0.3, 0.3)) * mult
         current = max(-15.0, min(35.0, current))
         voltage = 77.5 - 0.05 * current + random.uniform(-0.1, 0.1)
+        
+        # Pengurangan Bensin saat Mode ICE / HYBRID aktif
+        if self.drive_mode in ["ICE", "HYBRID"] and self.speed > 0:
+            self.fuel = max(5.0, self.fuel - 0.01)
+
+        if self.drive_mode == "ICE" and self.tick % 200 < 50:
+            voltage = 63.0
+
         self.temp = max(27.0, min(32.0, self.temp + random.uniform(-0.05, 0.05)))
         
         return {
             "speed": round(self.speed, 1), "voltage": round(voltage, 1),
             "current": round(current, 1), "temp": round(self.temp, 1),
+            "fuel_level": round(self.fuel, 1),
             "tpms": [33, 33, 32, 32], "tpms_temp": [31, 31, 30, 30],
-            "door": False, "belt": True, "drive_mode": self.drive_mode
+            "door": False, "belt": True, "drive_mode": self.drive_mode,
+            "accel_state": accel_state
         }
 
 
@@ -369,6 +405,17 @@ class IconWidget(QWidget):
             p.setBrush(c)
             p.drawRoundedRect(QRectF(36, 17, 3, 8), 1, 1)
             p.drawRoundedRect(QRectF(6, 13, 26 * self.level / 100.0, 16), 2, 2)
+        elif self.kind == "fuel":
+            # Ikon Pompa Bensin / Tangki
+            p.setPen(QPen(c, 2.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(6, 10, 24, 28), 4, 4)
+            p.drawRoundedRect(QRectF(10, 14, 16, 10), 2, 2)
+            p.setPen(QPen(c, 2.5))
+            p.drawLine(int(30), int(18), int(36), int(18))
+            p.drawLine(int(36), int(18), int(36), int(32))
+            p.setBrush(c)
+            p.drawEllipse(QPointF(36, 34), 3, 3)
         elif self.kind == "voltage":
             p.setPen(QPen(c, 2.5))
             p.drawEllipse(QPointF(22, 22), 16, 16)
@@ -431,7 +478,7 @@ class StatCard(QFrame):
         self.chip = QLabel("--")
         self.chip.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.lbl_value = QLabel("--")
-        self.lbl_value.setStyleSheet("color: #f8fafc; font-size: 26px; font-weight: bold;")
+        self.lbl_value.setStyleSheet("color: #f8fafc; font-size: 24px; font-weight: bold;")
         self.lbl_sub = QLabel("")
         self.lbl_sub.setStyleSheet("color: #64748b; font-size: 11px;")
         self.spark = Sparkline() if with_spark else None
@@ -450,14 +497,14 @@ class StatCard(QFrame):
             col.addWidget(self.spark)
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(14, 8, 14, 8)
+        lay.setContentsMargins(14, 6, 14, 6)
         lay.setSpacing(12)
         lay.addWidget(self.icon, alignment=Qt.AlignVCenter)
         lay.addLayout(col, stretch=1)
 
     def update_card(self, value, unit, sub, chip_text, color, level=None):
         self.lbl_value.setText(
-            f"{value}<span style='font-size:16px; color:{GRAY}; font-weight:600;'> {unit}</span>")
+            f"{value}<span style='font-size:15px; color:{GRAY}; font-weight:600;'> {unit}</span>")
         self.lbl_sub.setText(sub)
         key = (chip_text, color)
         if key != self._chip_key:
@@ -479,7 +526,7 @@ class StatusTile(QFrame):
         self.lbl_title = QLabel(title.upper())
         self.lbl_title.setStyleSheet(f"color: {GRAY}; font-size: 11px; font-weight: bold;")
         self.lbl_value = QLabel("--")
-        self.lbl_value.setStyleSheet("color: #f8fafc; font-size: 20px; font-weight: bold;")
+        self.lbl_value.setStyleSheet("color: #f8fafc; font-size: 18px; font-weight: bold;")
         self.lbl_sub = QLabel("")
         self.lbl_sub.setStyleSheet("color: #64748b; font-size: 11px;")
 
@@ -512,14 +559,12 @@ class AuthPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(40, 40, 40, 40)
 
-        # Container Card Utama
         card = QFrame()
         card.setObjectName("card")
         card.setStyleSheet(card_style("#334155", 2))
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(30, 30, 30, 30)
 
-        # Header Logo & Judul
         hdr = QHBoxLayout()
         logo_l = make_logo(LOGO_POLIBATAM, 64, True, "POLIBATAM")
         logo_r = make_logo(LOGO_TRE, 64, False, "TRE")
@@ -543,11 +588,9 @@ class AuthPage(QWidget):
 
         card_layout.addSpacing(30)
 
-        # 3 Opsi Login
         grid = QGridLayout()
         grid.setSpacing(20)
 
-        # 1. Fingerprint
         btn_finger = QPushButton("👆\n\nPINDAI SIDIK JARI\n(Fingerprint Sensor)")
         btn_finger.setFont(font(14, True))
         btn_finger.setStyleSheet("""
@@ -556,7 +599,6 @@ class AuthPage(QWidget):
         """)
         btn_finger.clicked.connect(lambda: self.verify_access("Fingerprint Terverifikasi", "Pengemudi: Atmarahil Satyaki"))
 
-        # 2. Kartu RFID / NFC
         btn_rfid = QPushButton("💳\n\nTEMPELKAN KARTU\n(RFID / NFC Tag)")
         btn_rfid.setFont(font(14, True))
         btn_rfid.setStyleSheet("""
@@ -565,7 +607,6 @@ class AuthPage(QWidget):
         """)
         btn_rfid.clicked.connect(lambda: self.verify_access("Kartu RFID Terverifikasi", "E-KTM Polibatam: 3112301001"))
 
-        # 3. Input Manual PIN/NIP
         manual_box = QFrame()
         manual_box.setStyleSheet("background-color: #1e293b; border-radius: 12px; padding: 15px;")
         v_man = QVBoxLayout(manual_box)
@@ -634,7 +675,6 @@ class DashboardPage(QWidget):
         root.setContentsMargins(14, 10, 14, 12)
         root.setSpacing(10)
 
-        # ---- Header
         header = self.make_card()
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 8, 16, 8)
@@ -656,7 +696,6 @@ class DashboardPage(QWidget):
         tcol.addWidget(title)
         tcol.addWidget(subtitle)
 
-        # Tombol Logout
         btn_logout = QPushButton("🔒 KUNCI VEHICLE")
         btn_logout.setFont(font(11, True))
         btn_logout.setStyleSheet("""
@@ -673,7 +712,6 @@ class DashboardPage(QWidget):
         hl.addWidget(btn_logout)
         root.addWidget(header)
 
-        # ---- Strip: Jam & User Info
         strip = QHBoxLayout()
         strip.setContentsMargins(6, 0, 6, 0)
         self.lbl_time = QLabel("--:--")
@@ -694,7 +732,6 @@ class DashboardPage(QWidget):
         strip.addWidget(self.lbl_source)
         root.addLayout(strip)
 
-        # ---- Panel Kontrol Mode Berkendara Hibrida
         mode_bar = self.make_card()
         mb_layout = QHBoxLayout(mode_bar)
         mb_layout.setContentsMargins(14, 6, 14, 6)
@@ -723,11 +760,9 @@ class DashboardPage(QWidget):
 
         root.addWidget(mode_bar)
 
-        # ---- Baris Utama: Kondisi Ban | Speedometer | Stat Cards
         main_row = QHBoxLayout()
         main_row.setSpacing(10)
 
-        # 1. Ban View Card
         car_card = self.make_card()
         cl = QVBoxLayout(car_card)
         cl.setContentsMargins(12, 10, 12, 8)
@@ -737,22 +772,22 @@ class DashboardPage(QWidget):
         cl.addWidget(lbl_car)
         cl.addWidget(self.car_view, stretch=1)
 
-        # 2. Speedometer
         gauge_card = self.make_card()
         gl = QVBoxLayout(gauge_card)
         gl.setContentsMargins(8, 8, 8, 8)
         self.gauge = SpeedGauge()
         gl.addWidget(self.gauge)
 
-        # 3. Dedicated Telemetry Cards
         right = QVBoxLayout()
-        right.setSpacing(8)
+        right.setSpacing(6)
         self.card_bat = StatCard("Kapasitas Baterai", "battery")
+        self.card_fuel = StatCard("Tangki Bensin (Fuel)", "fuel")  # Penambahan Indikator Tangki Bensin
         self.card_volt = StatCard("Sensor Tegangan Baterai", "voltage")
         self.card_curr = StatCard("Sensor Arus Baterai", "current")
         self.card_pwr = StatCard("Daya Terpakai Total", "bolt", with_spark=True)
 
         right.addWidget(self.card_bat)
+        right.addWidget(self.card_fuel)
         right.addWidget(self.card_volt)
         right.addWidget(self.card_curr)
         right.addWidget(self.card_pwr)
@@ -762,11 +797,10 @@ class DashboardPage(QWidget):
         main_row.addLayout(right, 3)
         root.addLayout(main_row, 1)
 
-        # ---- Baris Bawah: 4 Ubin Status Sistem
         tiles = QHBoxLayout()
         tiles.setSpacing(10)
         self.tile_tire = StatusTile("Status Tekanan Ban")
-        self.tile_energy = StatusTile("Mode Energi Baterai")
+        self.tile_energy = StatusTile("Kondisi Energi Baterai")
         self.tile_belt = StatusTile("Sabuk & Pintu")
         self.tile_mode = StatusTile("Mode Penggerak")
         for t in (self.tile_tire, self.tile_energy, self.tile_belt, self.tile_mode):
@@ -792,6 +826,7 @@ class DashboardPage(QWidget):
         volt = float(d["voltage"])
         cur = float(d["current"])
         soc = int(d["soc"])
+        fuel = float(d.get("fuel", 85.0))
         pwr = float(d["power"])
         drive_mode = d.get("drive_mode", "EV")
 
@@ -801,22 +836,27 @@ class DashboardPage(QWidget):
         bc, bt = (GREEN, "Baik") if soc >= 50 else ((AMBER, "Sedang") if soc >= 20 else (RED, "Rendah"))
         self.card_bat.update_card(f"{soc}", "%", f"Tegangan Nominal Pack 72V", bt, bc, soc)
 
-        # 2. Dedicated Sensor Tegangan Card
+        # 2. Tangki Bensin Card
+        fuel_liters = round((fuel / 100.0) * FUEL_CAPACITY_LITERS, 1)
+        fc, ft = (GREEN, "Penuh") if fuel >= 50 else ((AMBER, "Cukup") if fuel >= 20 else (RED, "Rendah"))
+        self.card_fuel.update_card(f"{int(fuel)}", "%", f"{fuel_liters} L / {FUEL_CAPACITY_LITERS} L", ft, fc, int(fuel))
+
+        # 3. Dedicated Sensor Tegangan Card
         vc = GREEN if 70.0 <= volt <= 82.0 else RED
         self.card_volt.update_card(f"{volt:.1f}", "V", "Paket Baterai Utama", "Normal" if vc == GREEN else "Anomali", vc)
 
-        # 3. Dedicated Sensor Arus Card
+        # 4. Dedicated Sensor Arus Card
         cc = CYAN if cur < 0 else (AMBER if cur > 20 else GREEN)
         cur_status = "Charging" if cur < 0 else ("Beban Tinggi" if cur > 20 else "Normal")
         self.card_curr.update_card(f"{abs(cur):.1f}", "A", "Arus Masuk/Keluar", cur_status, cc)
 
-        # 4. Daya Terpakai Total
+        # 5. Daya Terpakai Total
         pc = GREEN if pwr < POWER_LOW else (AMBER if pwr < POWER_HIGH else RED)
         self.card_pwr.update_card(f"{pwr:.2f}", "kW", "Grafik 10 detik terakhir", "Efisien" if pc == GREEN else "Tinggi", pc)
         self.power_history.append(pwr)
         self.card_pwr.spark.set_values(list(self.power_history))
 
-        # 5. Detail Ban
+        # 6. Detail Ban
         tpms = d.get("tpms", [33, 33, 32, 32])
         tpms_temp = d.get("tpms_temp", [30, 30, 29, 29])
         self.car_view.set_tpms(tpms, tpms_temp)
@@ -826,25 +866,29 @@ class DashboardPage(QWidget):
         else:
             self.tile_tire.update_tile("Semua Ban Normal", f"Tekanan {TIRE_MIN}–{TIRE_MAX} PSI", GREEN)
 
-        # 6. Mode Energi Baterai
-        em_key = d.get("energy_mode", "STANDBY")
-        em_txt, em_col, em_sub = MODE_ENERGY_INFO[em_key]
+        # 7. Logika Tampilan Kondisi Energi Baterai
+        em_key = d.get("energy_mode", "IDLE")
+        if drive_mode == "ICE":
+            em_txt, em_col, em_sub = MODE_ENERGY_ICE.get(em_key, MODE_ENERGY_ICE["BATTERY_HOLD"])
+        else:
+            em_txt, em_col, em_sub = MODE_ENERGY_EV.get(em_key, MODE_ENERGY_EV["IDLE"])
+
         self.tile_energy.update_tile(em_txt, em_sub, em_col)
 
-        # 7. Sabuk & Pintu
+        # 8. Sabuk & Pintu
         if bool(d["door"]) or not bool(d["belt"]):
             self.tile_belt.update_tile("Peringatan Keamanan", "Cek pintu / sabuk pengaman", RED, True)
         else:
             self.tile_belt.update_tile("Sistem Keamanan Aman", "Pintu tertutup & sabuk terpasang", GREEN)
 
-        # 8. Mode Penggerak
+        # 9. Mode Penggerak
         dm_txt, dm_col, dm_sub = DRIVE_MODES.get(drive_mode, DRIVE_MODES["EV"])
         self.tile_mode.update_tile(dm_txt, dm_sub, dm_col)
         self.change_drive_mode(drive_mode)
 
 
 # ---------------------------------------------------------
-# Window Utama Aplikasi (Stacked Navigation)
+# Window Utama Aplikasi
 # ---------------------------------------------------------
 class EVDashboardMain(QMainWindow):
     def __init__(self, port=None):
@@ -865,7 +909,6 @@ class EVDashboardMain(QMainWindow):
         self.raw = dict(DEFAULT_RAW)
         self.sim = Simulator()
 
-        # Stack Navigation (Multi Halaman)
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
@@ -875,7 +918,6 @@ class EVDashboardMain(QMainWindow):
         self.stack.addWidget(self.page_auth)
         self.stack.addWidget(self.page_dash)
 
-        # Mulai di Halaman Autentikasi
         self.stack.setCurrentWidget(self.page_auth)
 
         self.timer = QTimer()
