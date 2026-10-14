@@ -1,0 +1,1026 @@
+import sys
+import os
+import json
+import math
+import random
+import datetime
+from collections import deque
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError:
+    serial = None
+    list_ports = None
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel,
+    QVBoxLayout, QHBoxLayout, QFrame, QSizePolicy,
+    QStackedWidget, QPushButton, QLineEdit, QGridLayout, QMessageBox
+)
+from PyQt5.QtCore import QTimer, Qt, QRectF, QPointF
+from PyQt5.QtGui import (
+    QFont, QPainter, QColor, QPen, QPixmap, QPainterPath,
+    QLinearGradient, QPolygonF
+)
+
+# ---------------------------------------------------------
+# Konfigurasi Utama
+# ---------------------------------------------------------
+APP_TITLE = "SMART E-VEHICLE MONITORING SYSTEM"
+APP_SUBTITLE = "Sistem Pemantauan Kendaraan Listrik • Politeknik Negeri Batam"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CAR_IMAGES = ["car_topview.png", "car_topview.jpg", "car_topview.png.jfif", "car_topview.jfif"]
+LOGO_POLIBATAM = "logo_polibatam.png"
+LOGO_TRE = "logo_tre.png"
+
+BAUDRATE = 115200
+UPDATE_MS = 100            # 10 Hz
+HISTORY_LEN = 100          # titik grafik mini (10 detik)
+
+MAX_SPEED = 180
+ZONE_WARN = 120            # km/h
+ZONE_RED = 150             # km/h
+TIRE_MIN, TIRE_MAX = 30, 36   # PSI normal
+POWER_LOW, POWER_HIGH = 2.5, 4.0   # kW
+FUEL_CAPACITY_LITERS = 45.0
+
+GREEN, AMBER, RED, CYAN, GRAY = "#22c55e", "#f59e0b", "#ef4444", "#38bdf8", "#94a3b8"
+
+MODE_ENERGY_EV = {
+    "CHARGING": ("Charging ⚡", CYAN, "Baterai diisi daya"),
+    "DISCHARGING": ("Discharging ⚡", AMBER, "Baterai menyuplai daya"),
+    "IDLE": ("Idle 💤", GREEN, "Baterai posisi siaga"),
+}
+
+MODE_ENERGY_ICE = {
+    "SELF_CHARGING": ("Self-Charging", CYAN, "Mesin memutar generator (<20%)"),
+    "BATTERY_HOLD": ("Battery Hold", GREEN, "Menyuplai sistem pembantu"),
+    "REGENERATIVE_READY": ("Regen Ready", AMBER, "Siap menampung energi rem"),
+}
+
+DRIVE_MODES = {
+    "EV": ("EV Mode", CYAN, "100% Motor Listrik Baterai"),
+    "HYBRID": ("HEV Mode", AMBER, "Kombinasi Motor & Bensin"),
+    "ICE": ("ICE Mode", RED, "100% Mesin Pembakaran Dalam"),
+}
+
+TIRE_NAMES = ["FL", "FR", "RL", "RR"]
+HARI = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+         "Agustus", "September", "Oktober", "November", "Desember"]
+
+DEFAULT_RAW = {
+    "speed": 0.0, "voltage": 77.0, "current": 0.0, "temp": 28.0,
+    "fuel_level": 85.0, "tpms": [33, 33, 32, 32], "tpms_temp": [30, 30, 29, 29],
+    "door": False, "belt": True, "drive_mode": "EV", "accel_state": "DECEL"
+}
+
+VALID_PINS = ["1234", "3112301001", "2026"]
+
+
+# ---------------------------------------------------------
+# Helper Style & Utility
+# ---------------------------------------------------------
+def font(px, bold=False):
+    f = QFont("Segoe UI")
+    f.setPixelSize(max(8, int(px)))
+    f.setBold(bold)
+    return f
+
+
+def card_style(border="#1e293b", width=1):
+    return (f"QFrame#card {{ background-color: #111827; "
+            f"border: {width}px solid {border}; border-radius: 20px; }}")
+
+
+def chip_style(color):
+    c = QColor(color)
+    return (f"color: {color}; background-color: rgba({c.red()},{c.green()},{c.blue()},35); "
+            "border-radius: 8px; padding: 3px 10px; font-size: 11px; font-weight: bold;")
+
+
+def load_pixmap(names):
+    if isinstance(names, str):
+        names = [names]
+    for name in names:
+        path = os.path.join(BASE_DIR, name)
+        if os.path.exists(path):
+            pm = QPixmap(path)
+            if not pm.isNull():
+                return pm
+    return None
+
+
+def make_logo(name, size, white_bg, fallback_text):
+    dpr = 2
+    pm = QPixmap(size * dpr, size * dpr)
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+
+    logo = load_pixmap(name)
+    if white_bg:
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawRoundedRect(QRectF(0, 0, size, size), 12, 12)
+    inner = size - 10 if white_bg else size
+    if logo:
+        sc = logo.scaled(int(inner * dpr), int(inner * dpr), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        sc.setDevicePixelRatio(dpr)
+        x = (size - sc.width() / dpr) / 2
+        y = (size - sc.height() / dpr) / 2
+        p.drawPixmap(QPointF(x, y), sc)
+    else:
+        p.setPen(QColor("#334155"))
+        p.setFont(font(10, True))
+        p.drawText(QRectF(0, 0, size, size), Qt.AlignCenter, fallback_text)
+    p.end()
+
+    lbl = QLabel()
+    lbl.setPixmap(pm)
+    lbl.setFixedSize(size, size)
+    return lbl
+
+
+def derive_energy_mode(current, speed, drive_mode, soc, accel_state="HOLD"):
+    if drive_mode == "ICE":
+        if soc < 20:
+            return "SELF_CHARGING"
+        elif accel_state == "DECEL":
+            return "REGENERATIVE_READY"
+        else:
+            return "BATTERY_HOLD"
+    else:
+        if current < -0.5:
+            return "CHARGING"
+        if current > 0.5 or speed > 0:
+            return "DISCHARGING"
+        return "IDLE"
+
+
+def build_view(raw):
+    d = dict(raw)
+    v = float(d.get("voltage", 0))
+    i = float(d.get("current", 0))
+    spd = float(d.get("speed", 0))
+    dm = d.get("drive_mode", "EV")
+    soc = int(max(0, min(100, (v - 60.0) / (84.0 - 60.0) * 100)))
+    accel = d.get("accel_state", "HOLD")
+
+    d.setdefault("power", round(v * abs(i) / 1000.0, 2))
+    d["soc"] = soc
+    d["fuel"] = float(d.get("fuel_level", 85.0))
+    d["energy_mode"] = derive_energy_mode(i, spd, dm, soc, accel)
+    return d
+
+
+# ---------------------------------------------------------
+# Simulator Data
+# ---------------------------------------------------------
+class Simulator:
+    def __init__(self):
+        self.speed = 0.0
+        self.target = 0.0
+        self.temp = 29.0
+        self.fuel = 85.0
+        self.tick = 0
+        self.drive_mode = "EV"
+
+    def step(self):
+        self.tick += 1
+        if self.tick % 60 == 1:
+            self.target = random.choice([0.0, random.uniform(20, 85)])
+        
+        accel_val = (self.target - self.speed) * 0.1
+        accel_val = max(-1.5, min(0.8, accel_val))
+        accel_state = "ACCEL" if accel_val > 0.1 else ("DECEL" if accel_val < -0.1 else "HOLD")
+        
+        self.speed = max(0.0, self.speed + accel_val)
+        
+        mult = 1.0 if self.drive_mode == "EV" else (0.4 if self.drive_mode == "HYBRID" else 0.05)
+        current = (self.speed * 0.3 + accel_val * 6 + random.uniform(-0.3, 0.3)) * mult
+        current = max(-15.0, min(35.0, current))
+        voltage = 77.5 - 0.05 * current + random.uniform(-0.1, 0.1)
+        
+        if self.drive_mode in ["ICE", "HYBRID"] and self.speed > 0:
+            self.fuel = max(5.0, self.fuel - 0.01)
+
+        if self.drive_mode == "ICE" and self.tick % 200 < 50:
+            voltage = 63.0
+
+        self.temp = max(27.0, min(32.0, self.temp + random.uniform(-0.05, 0.05)))
+        
+        return {
+            "speed": round(self.speed, 1), "voltage": round(voltage, 1),
+            "current": round(current, 1), "temp": round(self.temp, 1),
+            "fuel_level": round(self.fuel, 1),
+            "tpms": [33, 33, 32, 32], "tpms_temp": [31, 31, 30, 30],
+            "door": False, "belt": True, "drive_mode": self.drive_mode,
+            "accel_state": accel_state
+        }
+
+
+# ---------------------------------------------------------
+# Custom Widgets
+# ---------------------------------------------------------
+class SpeedGauge(QWidget):
+    START = 225.0
+    SPAN = 270.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.value = 0.0
+        self.setMinimumSize(250, 250)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_value(self, v):
+        self.value = max(0.0, min(float(MAX_SPEED), v))
+        self.update()
+
+    def _pt(self, cx, cy, rad, v):
+        a = math.radians(self.START - self.SPAN * v / MAX_SPEED)
+        return QPointF(cx + rad * math.cos(a), cy - rad * math.sin(a))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+
+        w, h = self.width(), self.height()
+        s = min(w, h)
+        cx, cy = w / 2, h / 2
+        pw = s * 0.045
+        r = s / 2 - pw / 2 - 4
+        rect = QRectF(cx - r, cy - r, 2 * r, 2 * r)
+
+        p.setPen(QPen(QColor("#1e293b"), pw, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(rect, int(self.START * 16), int(-self.SPAN * 16))
+        for lo, hi, col in ((ZONE_WARN, ZONE_RED, "#4b3a12"), (ZONE_RED, MAX_SPEED, "#4b1d24")):
+            a0 = self.START - self.SPAN * lo / MAX_SPEED
+            span = -self.SPAN * (hi - lo) / MAX_SPEED
+            p.setPen(QPen(QColor(col), pw, Qt.SolidLine, Qt.FlatCap))
+            p.drawArc(rect, int(a0 * 16), int(span * 16))
+
+        if self.value > 0.5:
+            col = RED if self.value >= ZONE_RED else (AMBER if self.value >= ZONE_WARN else CYAN)
+            p.setPen(QPen(QColor(col), pw, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(rect, int(self.START * 16), int(-self.SPAN * (self.value / MAX_SPEED) * 16))
+
+        r_in = r - pw / 2 - s * 0.025
+        for v in range(0, MAX_SPEED + 1, 10):
+            major = v % 30 == 0
+            ln = s * (0.045 if major else 0.025)
+            p.setPen(QPen(QColor("#94a3b8" if major else "#334155"), 2.0 if major else 1.0))
+            p.drawLine(self._pt(cx, cy, r_in, v), self._pt(cx, cy, r_in - ln, v))
+            if major:
+                lp = self._pt(cx, cy, r_in - s * 0.09, v)
+                p.setFont(font(s * 0.040, True))
+                p.setPen(QColor("#cbd5e1"))
+                p.drawText(QRectF(lp.x() - 20, lp.y() - 10, 40, 20), Qt.AlignCenter, str(v))
+
+        p.setPen(QColor("#64748b"))
+        p.setFont(font(s * 0.035, True))
+        p.drawText(QRectF(0, cy - s * 0.26, w, s * 0.06), Qt.AlignCenter, "KECEPATAN")
+        p.setPen(QColor("#f8fafc"))
+        p.setFont(font(s * 0.24, True))
+        p.drawText(QRectF(0, cy - s * 0.20, w, s * 0.28), Qt.AlignCenter, str(int(self.value)))
+        p.setPen(QColor(GRAY))
+        p.setFont(font(s * 0.055, True))
+        p.drawText(QRectF(0, cy + s * 0.10, w, s * 0.08), Qt.AlignCenter, "km/h")
+
+
+class CarView(QWidget):
+    WHEEL_X = 0.26
+    WHEEL_Y_FRONT = 0.26
+    WHEEL_Y_REAR = 0.755
+    WHEEL_W = 0.030
+    WHEEL_H = 0.110
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.tpms = [33, 33, 32, 32]
+        self.tpms_temp = [30, 30, 29, 29]
+        self.soc = 85
+        self.temp = 28
+        self.car_pixmap = load_pixmap(CAR_IMAGES)
+        self._scaled = None
+        self._scaled_h = -1
+        self.setMinimumSize(220, 260)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_data(self, tpms, tpms_temp, soc, temp):
+        self.tpms = tpms
+        if tpms_temp:
+            self.tpms_temp = tpms_temp
+        self.soc = max(0, min(100, soc))
+        self.temp = max(0, min(100, temp))
+        self.update()
+
+    def _scaled_car(self, height):
+        if self._scaled_h != height:
+            self._scaled = self.car_pixmap.scaledToHeight(height, Qt.SmoothTransformation)
+            self._scaled_h = height
+        return self._scaled
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+
+        w, h = self.width(), self.height()
+        cx = w / 2
+        top = 10
+        ih = max(80, int(h - 30 - top))
+
+        # 1. Gambar Mobil di Tengah
+        if self.car_pixmap:
+            sp = self._scaled_car(ih)
+            iw = sp.width()
+            p.drawPixmap(int(cx - iw / 2), top, sp)
+        else:
+            iw = ih * 0.76
+            p.setPen(QPen(QColor("#334155"), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(cx - iw * 0.2, top + ih * 0.12, iw * 0.4, ih * 0.76), 20, 20)
+
+        # 2. Vertical Meters Kiri (Baterai) & Kanan (Suhu) ala Foto 2
+        bar_w = 6
+        bar_h = ih * 0.6
+        bar_y = top + (ih - bar_h) / 2
+
+        # Meter Baterai Kiri
+        bar_x_left = cx - iw/2 - 25
+        if bar_x_left > 15:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#1e293b"))
+            p.drawRoundedRect(QRectF(bar_x_left, bar_y, bar_w, bar_h), 3, 3)
+            fill_h_bat = (self.soc / 100.0) * bar_h
+            p.setBrush(QColor(CYAN))
+            p.drawRoundedRect(QRectF(bar_x_left, bar_y + (bar_h - fill_h_bat), bar_w, fill_h_bat), 3, 3)
+            p.setPen(QColor("#f8fafc"))
+            p.setFont(font(9, True))
+            p.drawText(QRectF(bar_x_left - 15, bar_y + bar_h + 5, 36, 15), Qt.AlignCenter, f"{self.soc}%")
+
+        # Meter Suhu Kanan
+        bar_x_right = cx + iw/2 + 18
+        if bar_x_right < w - 20:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#1e293b"))
+            p.drawRoundedRect(QRectF(bar_x_right, bar_y, bar_w, bar_h), 3, 3)
+            fill_h_temp = (self.temp / 60.0) * bar_h
+            p.setBrush(QColor(CYAN))
+            p.drawRoundedRect(QRectF(bar_x_right, bar_y + (bar_h - fill_h_temp), bar_w, fill_h_temp), 3, 3)
+            p.setPen(QColor("#f8fafc"))
+            p.setFont(font(9, True))
+            p.drawText(QRectF(bar_x_right - 15, bar_y + bar_h + 5, 36, 15), Qt.AlignCenter, f"{int(self.temp)}°C")
+
+        # 3. TPMS Indicators 4 Ban
+        tw, th = iw * self.WHEEL_W, ih * self.WHEEL_H
+        yf = top + ih * self.WHEEL_Y_FRONT
+        yr = top + ih * self.WHEEL_Y_REAR
+        dx = iw * self.WHEEL_X
+        centers = [(cx - dx, yf), (cx + dx, yf), (cx - dx, yr), (cx + dx, yr)]
+
+        for i, (x, y) in enumerate(centers):
+            psi = self.tpms[i]
+            ok = TIRE_MIN <= psi <= TIRE_MAX
+            col = QColor(GREEN if ok else RED)
+            wx, wy = x - tw / 2, y - th / 2
+
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(wx, wy, tw, th), 3, 3)
+
+            tx = wx - 42 if i % 2 == 0 else wx + tw + 2
+            ty = y - 12
+            p.setPen(col)
+            p.setFont(font(11, True))
+            p.drawText(QRectF(tx, ty, 40, 16), Qt.AlignCenter, f"{psi}")
+
+
+class IconWidget(QWidget):
+    def __init__(self, kind, parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.color = QColor(GRAY)
+        self.level = 100
+        self.setFixedSize(40, 40)
+
+    def set_state(self, color, level=None):
+        self.color = QColor(color)
+        if level is not None:
+            self.level = max(0, min(100, level))
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.translate(2, 2)
+        c = self.color
+        if self.kind == "battery":
+            p.setPen(QPen(c, 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(2, 8, 28, 18), 3, 3)
+            p.setPen(Qt.NoPen)
+            p.setBrush(c)
+            p.drawRoundedRect(QRectF(30, 14, 3, 6), 1, 1)
+            p.drawRoundedRect(QRectF(5, 11, 22 * self.level / 100.0, 12), 2, 2)
+        elif self.kind == "fuel":
+            p.setPen(QPen(c, 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(5, 8, 20, 22), 3, 3)
+            p.drawRoundedRect(QRectF(8, 11, 14, 8), 2, 2)
+            p.drawLine(int(25), int(14), int(30), int(14))
+            p.drawLine(int(30), int(14), int(30), int(26))
+            p.setBrush(c)
+            p.drawEllipse(QPointF(30, 27), 2, 2)
+        elif self.kind == "voltage":
+            p.setPen(QPen(c, 2))
+            p.drawEllipse(QPointF(18, 18), 13, 13)
+            p.setPen(Qt.NoPen)
+            p.setBrush(c)
+            p.drawPolygon(QPolygonF([QPointF(12, 9), QPointF(18, 22), QPointF(24, 9)]))
+        elif self.kind == "current":
+            p.setPen(QPen(c, 2))
+            p.drawEllipse(QPointF(18, 18), 13, 13)
+            p.setPen(Qt.NoPen)
+            p.setBrush(c)
+            p.drawPolygon(QPolygonF([QPointF(18, 7), QPointF(11, 23), QPointF(25, 23)]))
+        elif self.kind == "bolt":
+            p.setPen(Qt.NoPen)
+            p.setBrush(c)
+            p.drawPolygon(QPolygonF([
+                QPointF(20, 2), QPointF(8, 20), QPointF(16, 20),
+                QPointF(14, 34), QPointF(28, 14), QPointF(19, 14)]))
+
+
+class Sparkline(QWidget):
+    def __init__(self, color=CYAN, parent=None):
+        super().__init__(parent)
+        self.values = []
+        self.color = QColor(color)
+        self.setFixedHeight(35)
+
+    def set_values(self, vals):
+        self.values = vals
+        self.update()
+
+    def paintEvent(self, event):
+        if len(self.values) < 2:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height() - 4
+        hi = max(max(self.values), 1.0)
+        pts = [QPointF(i * w / (HISTORY_LEN - 1), 2 + h - (v / hi) * h)
+               for i, v in enumerate(self.values)]
+
+        line = QPainterPath(pts[0])
+        for pt in pts[1:]:
+            line.lineTo(pt)
+
+        p.setPen(QPen(self.color, 2))
+        p.drawPath(line)
+
+
+class CompactStatCard(QFrame):
+    def __init__(self, title, icon_kind):
+        super().__init__()
+        self.setObjectName("card")
+        self.setStyleSheet(card_style("#1e293b", 1))
+
+        self.icon = IconWidget(icon_kind)
+        self.lbl_title = QLabel(title.upper())
+        self.lbl_title.setStyleSheet(f"color: {GRAY}; font-size: 10px; font-weight: bold;")
+        self.chip = QLabel("--")
+        self.chip.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.lbl_value = QLabel("--")
+        self.lbl_value.setStyleSheet("color: #f8fafc; font-size: 18px; font-weight: bold;")
+        self.lbl_sub = QLabel("")
+        self.lbl_sub.setStyleSheet("color: #64748b; font-size: 10px;")
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(self.lbl_title)
+        top_row.addStretch()
+        top_row.addWidget(self.chip, alignment=Qt.AlignVCenter)
+
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        col.addLayout(top_row)
+        col.addWidget(self.lbl_value)
+        col.addWidget(self.lbl_sub)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(10)
+        lay.addWidget(self.icon, alignment=Qt.AlignVCenter)
+        lay.addLayout(col, stretch=1)
+
+    def update_card(self, value, unit, sub, chip_text, color, level=None):
+        self.lbl_value.setText(
+            f"{value}<span style='font-size:12px; color:{GRAY}; font-weight:600;'> {unit}</span>")
+        self.lbl_sub.setText(sub)
+        self.chip.setText(chip_text)
+        self.chip.setStyleSheet(chip_style(color))
+        self.icon.set_state(color, level)
+
+
+class StatusTile(QFrame):
+    def __init__(self, title):
+        super().__init__()
+        self.setObjectName("card")
+        self.setStyleSheet(card_style("#1e293b", 1))
+        self._key = None
+
+        self.lbl_title = QLabel(title.upper())
+        self.lbl_title.setStyleSheet(f"color: {GRAY}; font-size: 10px; font-weight: bold;")
+        self.lbl_value = QLabel("--")
+        self.lbl_value.setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: bold;")
+        self.lbl_sub = QLabel("")
+        self.lbl_sub.setStyleSheet("color: #64748b; font-size: 9px;")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(2)
+        lay.addWidget(self.lbl_title)
+        lay.addWidget(self.lbl_value)
+        lay.addWidget(self.lbl_sub)
+
+    def update_tile(self, value, sub, color, alert=False):
+        self.lbl_sub.setText(sub)
+        key = (value, color, alert)
+        if key != self._key:
+            self._key = key
+            self.lbl_value.setText(f"<span style='color:{color};'>●</span>&nbsp;{value}")
+            self.setStyleSheet(card_style(color, 2 if alert else 1))
+
+
+# ---------------------------------------------------------
+# HALAMAN 1: AUTENTIKASI & AKSES MASUK
+# ---------------------------------------------------------
+class AuthPage(QWidget):
+    def __init__(self, on_login_success):
+        super().__init__()
+        self.on_login_success = on_login_success
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(40, 40, 40, 40)
+
+        card = QFrame()
+        card.setObjectName("card")
+        card.setStyleSheet(card_style("#334155", 2))
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(30, 30, 30, 30)
+
+        hdr = QHBoxLayout()
+        logo_l = make_logo(LOGO_POLIBATAM, 64, True, "POLIBATAM")
+        logo_r = make_logo(LOGO_TRE, 64, False, "TRE")
+        
+        v_title = QVBoxLayout()
+        title = QLabel("AUTENTIKASI PENGEMUDI")
+        title.setFont(font(24, True))
+        title.setAlignment(Qt.AlignCenter)
+        sub = QLabel("Silakan verifikasi identitas untuk mengaktifkan kendaraan")
+        sub.setStyleSheet(f"color: {GRAY}; font-size: 14px;")
+        sub.setAlignment(Qt.AlignCenter)
+        v_title.addWidget(title)
+        v_title.addWidget(sub)
+
+        hdr.addWidget(logo_l)
+        hdr.addStretch()
+        hdr.addLayout(v_title)
+        hdr.addStretch()
+        hdr.addWidget(logo_r)
+        card_layout.addLayout(hdr)
+
+        card_layout.addSpacing(30)
+
+        grid = QGridLayout()
+        grid.setSpacing(20)
+
+        btn_finger = QPushButton("👆\n\nPINDAI SIDIK JARI\n(Fingerprint Sensor)")
+        btn_finger.setFont(font(14, True))
+        btn_finger.setStyleSheet("""
+            QPushButton { background-color: #1e293b; color: #38bdf8; border: 2px solid #0284c7; border-radius: 12px; padding: 20px; }
+            QPushButton:hover { background-color: #0369a1; color: white; }
+        """)
+        btn_finger.clicked.connect(lambda: self.verify_access("Fingerprint Terverifikasi", "Pengemudi: Atmarahil Satyaki"))
+
+        btn_rfid = QPushButton("💳\n\nTEMPELKAN KARTU\n(RFID / NFC Tag)")
+        btn_rfid.setFont(font(14, True))
+        btn_rfid.setStyleSheet("""
+            QPushButton { background-color: #1e293b; color: #22c55e; border: 2px solid #16a34a; border-radius: 12px; padding: 20px; }
+            QPushButton:hover { background-color: #15803d; color: white; }
+        """)
+        btn_rfid.clicked.connect(lambda: self.verify_access("Kartu RFID Terverifikasi", "E-KTM Polibatam: 3112301001"))
+
+        manual_box = QFrame()
+        manual_box.setStyleSheet("background-color: #1e293b; border-radius: 12px; padding: 15px;")
+        v_man = QVBoxLayout(manual_box)
+        lbl_man = QLabel("🔑 INPUT MANUAL (NIP / PIN)")
+        lbl_man.setFont(font(12, True))
+        lbl_man.setStyleSheet("color: #f59e0b;")
+
+        self.txt_pin = QLineEdit()
+        self.txt_pin.setPlaceholderText("Masukkan PIN / NIM / NIP...")
+        self.txt_pin.setEchoMode(QLineEdit.Password)
+        self.txt_pin.setFont(font(14))
+        self.txt_pin.setStyleSheet("background-color: #0f1724; color: white; border: 1px solid #475569; border-radius: 8px; padding: 8px;")
+
+        btn_pin = QPushButton("VERIFIKASI PIN")
+        btn_pin.setFont(font(12, True))
+        btn_pin.setStyleSheet("""
+            QPushButton { background-color: #d97706; color: white; border-radius: 8px; padding: 10px; }
+            QPushButton:hover { background-color: #b45309; }
+        """)
+        btn_pin.clicked.connect(self.check_pin)
+
+        v_man.addWidget(lbl_man)
+        v_man.addWidget(self.txt_pin)
+        v_man.addWidget(btn_pin)
+
+        grid.addWidget(btn_finger, 0, 0)
+        grid.addWidget(btn_rfid, 0, 1)
+        grid.addWidget(manual_box, 0, 2)
+
+        card_layout.addLayout(grid)
+        card_layout.addStretch()
+
+        layout.addWidget(card)
+
+    def check_pin(self):
+        pin = self.txt_pin.text().strip()
+        if pin in VALID_PINS:
+            self.verify_access("Akses PIN Manual Berhasil", f"NIP/PIN ID: {pin}")
+        else:
+            QMessageBox.critical(self, "Akses Ditolak", "PIN / NIM / NIP Tidak Terdaftar!")
+
+    def verify_access(self, method_title, user_info):
+        QMessageBox.information(self, "Akses Diberikan", f"{method_title}\n{user_info}\n\nKendaraan Siap Digunakan!")
+        self.on_login_success(user_info)
+
+
+# ---------------------------------------------------------
+# HALAMAN 2: DASHBOARD TELEMETRI MODERN (FOTO 2 STYLE)
+# ---------------------------------------------------------
+class DashboardPage(QWidget):
+    def __init__(self, on_logout, on_drive_mode_change):
+        super().__init__()
+        self.on_logout = on_logout
+        self.on_drive_mode_change = on_drive_mode_change
+        self.power_history = deque(maxlen=HISTORY_LEN)
+        self.init_ui()
+
+    def make_card(self):
+        card = QFrame()
+        card.setObjectName("card")
+        card.setStyleSheet(card_style())
+        return card
+
+    def init_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(10)
+
+        # 1. Floating Header Bar (Logo & Mode Bar Integrated)
+        header = self.make_card()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(14, 6, 14, 6)
+
+        logo_l = make_logo(LOGO_POLIBATAM, 50, True, "POLIBATAM")
+        logo_r = make_logo(LOGO_TRE, 50, False, "TRE")
+
+        v_title = QVBoxLayout()
+        v_title.setSpacing(0)
+        lbl_title = QLabel(APP_TITLE)
+        lbl_title.setFont(font(16, True))
+        lbl_title.setStyleSheet("color: #f8fafc;")
+        lbl_sub = QLabel(APP_SUBTITLE)
+        lbl_sub.setStyleSheet(f"color: {GRAY}; font-size: 11px;")
+        v_title.addWidget(lbl_title)
+        v_title.addWidget(lbl_sub)
+
+        # Mode Selector Bar
+        mode_box = QHBoxLayout()
+        mode_box.setSpacing(6)
+        self.btn_ev = QPushButton("⚡ EV")
+        self.btn_hybrid = QPushButton("🔄 HEV")
+        self.btn_ice = QPushButton("⛽ ICE")
+
+        for btn in (self.btn_ev, self.btn_hybrid, self.btn_ice):
+            btn.setFont(font(10, True))
+            btn.setCheckable(True)
+
+        self.btn_ev.clicked.connect(lambda: self.change_drive_mode("EV"))
+        self.btn_hybrid.clicked.connect(lambda: self.change_drive_mode("HYBRID"))
+        self.btn_ice.clicked.connect(lambda: self.change_drive_mode("ICE"))
+
+        mode_box.addWidget(self.btn_ev)
+        mode_box.addWidget(self.btn_hybrid)
+        mode_box.addWidget(self.btn_ice)
+
+        # Jam & User Info
+        self.lbl_time = QLabel("00:00")
+        self.lbl_time.setFont(font(18, True))
+        self.lbl_user = QLabel("Driver: -")
+        self.lbl_user.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold;")
+
+        btn_logout = QPushButton("🔒")
+        btn_logout.setFixedSize(32, 32)
+        btn_logout.setStyleSheet("""
+            QPushButton { background-color: #991b1b; color: white; border-radius: 8px; font-size: 12px; }
+            QPushButton:hover { background-color: #dc2626; }
+        """)
+        btn_logout.clicked.connect(self.on_logout)
+
+        hl.addWidget(logo_l)
+        hl.addLayout(v_title)
+        hl.addStretch()
+        hl.addLayout(mode_box)
+        hl.addStretch()
+        hl.addWidget(self.lbl_time)
+        hl.addWidget(self.lbl_user)
+        hl.addWidget(logo_r)
+        hl.addWidget(btn_logout)
+
+        root.addWidget(header)
+
+        # 2. Main 3-Column Layout (Ala Foto 2)
+        main_layout = QHBoxLayout()
+        main_layout.setSpacing(10)
+
+        # --- KOLOM 1: Telemetry Cards (Kiri) ---
+        col1 = QVBoxLayout()
+        col1.setSpacing(8)
+
+        self.card_bat = CompactStatCard("Baterai (SOC)", "battery")
+        self.card_fuel = CompactStatCard("Tangki Bensin", "fuel")
+        self.card_volt = CompactStatCard("Tegangan Pack", "voltage")
+        self.card_curr = CompactStatCard("Arus Baterai", "current")
+
+        col1.addWidget(self.card_bat)
+        col1.addWidget(self.card_fuel)
+        col1.addWidget(self.card_volt)
+        col1.addWidget(self.card_curr)
+
+        # --- KOLOM 2: Vehicle Visual & TPMS (Tengah) ---
+        col2_card = self.make_card()
+        col2_layout = QVBoxLayout(col2_card)
+        col2_layout.setContentsMargins(10, 10, 10, 10)
+
+        lbl_v_title = QLabel("WHOLE CAR & TPMS")
+        lbl_v_title.setFont(font(11, True))
+        lbl_v_title.setStyleSheet(f"color: {GRAY};")
+        lbl_v_title.setAlignment(Qt.AlignCenter)
+
+        self.car_view = CarView()
+
+        col2_layout.addWidget(lbl_v_title)
+        col2_layout.addWidget(self.car_view, stretch=1)
+
+        # --- KOLOM 3: Speedometer & Telemetry Graph (Kanan) ---
+        col3_layout = QVBoxLayout()
+        col3_layout.setSpacing(8)
+
+        # Box Speedometer Dial
+        gauge_card = self.make_card()
+        gl = QVBoxLayout(gauge_card)
+        gl.setContentsMargins(6, 6, 6, 6)
+        self.gauge = SpeedGauge()
+        gl.addWidget(self.gauge)
+
+        # Box Grafik Daya
+        pwr_card = self.make_card()
+        pl = QVBoxLayout(pwr_card)
+        pl.setContentsMargins(10, 8, 10, 8)
+
+        pwr_hdr = QHBoxLayout()
+        lbl_pwr_t = QLabel("TOTAL POWER DRAW")
+        lbl_pwr_t.setFont(font(10, True))
+        lbl_pwr_t.setStyleSheet(f"color: {GRAY};")
+        self.lbl_pwr_val = QLabel("0.00 kW")
+        self.lbl_pwr_val.setFont(font(14, True))
+        self.lbl_pwr_val.setStyleSheet("color: #f8fafc;")
+
+        pwr_hdr.addWidget(lbl_pwr_t)
+        pwr_hdr.addStretch()
+        pwr_hdr.addWidget(self.lbl_pwr_val)
+
+        self.spark = Sparkline()
+
+        pl.addLayout(pwr_hdr)
+        pl.addWidget(self.spark)
+
+        col3_layout.addWidget(gauge_card, stretch=2)
+        col3_layout.addWidget(pwr_card, stretch=1)
+
+        main_layout.addLayout(col1, stretch=1)
+        main_layout.addWidget(col2_card, stretch=1)
+        main_layout.addLayout(col3_layout, stretch=1)
+
+        root.addLayout(main_layout, stretch=1)
+
+        # 3. Bottom System Status Bar (4 Tiles)
+        bottom_tiles = QHBoxLayout()
+        bottom_tiles.setSpacing(10)
+
+        self.tile_tire = StatusTile("Status Ban")
+        self.tile_energy = StatusTile("Kondisi Baterai")
+        self.tile_belt = StatusTile("Sabuk & Pintu")
+        self.tile_mode = StatusTile("Mode Penggerak")
+
+        for t in (self.tile_tire, self.tile_energy, self.tile_belt, self.tile_mode):
+            bottom_tiles.addWidget(t, 1)
+
+        root.addLayout(bottom_tiles)
+
+    def change_drive_mode(self, mode_key):
+        self.btn_ev.setChecked(mode_key == "EV")
+        self.btn_hybrid.setChecked(mode_key == "HYBRID")
+        self.btn_ice.setChecked(mode_key == "ICE")
+
+        style_active = "background-color: #0284c7; color: white; border-radius: 6px; padding: 4px 10px;"
+        style_inactive = "background-color: #1e293b; color: #94a3b8; border-radius: 6px; padding: 4px 10px;"
+
+        self.btn_ev.setStyleSheet(style_active if mode_key == "EV" else style_inactive)
+        self.btn_hybrid.setStyleSheet(style_active if mode_key == "HYBRID" else style_inactive)
+        self.btn_ice.setStyleSheet(style_active if mode_key == "ICE" else style_inactive)
+
+        self.on_drive_mode_change(mode_key)
+
+    def render(self, d):
+        speed = float(d["speed"])
+        volt = float(d["voltage"])
+        cur = float(d["current"])
+        soc = int(d["soc"])
+        temp = float(d["temp"])
+        fuel = float(d.get("fuel", 85.0))
+        pwr = float(d["power"])
+        drive_mode = d.get("drive_mode", "EV")
+
+        self.gauge.set_value(speed)
+
+        # 1. Update Cards Telemetri Kiri
+        bc, bt = (GREEN, "Baik") if soc >= 50 else ((AMBER, "Sedang") if soc >= 20 else (RED, "Rendah"))
+        self.card_bat.update_card(f"{soc}", "%", "Nominal 72V", bt, bc, soc)
+
+        fuel_liters = round((fuel / 100.0) * FUEL_CAPACITY_LITERS, 1)
+        fc, ft = (GREEN, "Penuh") if fuel >= 50 else ((AMBER, "Cukup") if fuel >= 20 else (RED, "Rendah"))
+        self.card_fuel.update_card(f"{int(fuel)}", "%", f"{fuel_liters} L / {FUEL_CAPACITY_LITERS}L", ft, fc, int(fuel))
+
+        vc = GREEN if 70.0 <= volt <= 82.0 else RED
+        self.card_volt.update_card(f"{volt:.1f}", "V", "Baterai Utama", "Normal" if vc == GREEN else "Anomali", vc)
+
+        cc = CYAN if cur < 0 else (AMBER if cur > 20 else GREEN)
+        cur_status = "Charging" if cur < 0 else ("Beban Tinggi" if cur > 20 else "Normal")
+        self.card_curr.update_card(f"{abs(cur):.1f}", "A", "Arus Masuk/Keluar", cur_status, cc)
+
+        # 2. Update Power Draw
+        self.lbl_pwr_val.setText(f"{pwr:.2f} kW")
+        self.power_history.append(pwr)
+        self.spark.set_values(list(self.power_history))
+
+        # 3. Update Visual Mobil & TPMS
+        tpms = d.get("tpms", [33, 33, 32, 32])
+        tpms_temp = d.get("tpms_temp", [30, 30, 29, 29])
+        self.car_view.set_data(tpms, tpms_temp, soc, temp)
+
+        # 4. Update Tiles Bawah
+        bad = [(TIRE_NAMES[i], v) for i, v in enumerate(tpms) if not TIRE_MIN <= v <= TIRE_MAX]
+        if bad:
+            self.tile_tire.update_tile("Periksa Ban", ", ".join(f"{n} {v} PSI" for n, v in bad), RED, True)
+        else:
+            self.tile_tire.update_tile("Semua Ban Normal", f"Tekanan {TIRE_MIN}–{TIRE_MAX} PSI", GREEN)
+
+        em_key = d.get("energy_mode", "IDLE")
+        if drive_mode == "ICE":
+            em_txt, em_col, em_sub = MODE_ENERGY_ICE.get(em_key, MODE_ENERGY_ICE["BATTERY_HOLD"])
+        else:
+            em_txt, em_col, em_sub = MODE_ENERGY_EV.get(em_key, MODE_ENERGY_EV["IDLE"])
+
+        self.tile_energy.update_tile(em_txt, em_sub, em_col)
+
+        if bool(d["door"]) or not bool(d["belt"]):
+            self.tile_belt.update_tile("Peringatan Keamanan", "Cek pintu / sabuk pengaman", RED, True)
+        else:
+            self.tile_belt.update_tile("Sistem Keamanan Aman", "Pintu tertutup & sabuk terpasang", GREEN)
+
+        dm_txt, dm_col, dm_sub = DRIVE_MODES.get(drive_mode, DRIVE_MODES["EV"])
+        self.tile_mode.update_tile(dm_txt, dm_sub, dm_col)
+        self.change_drive_mode(drive_mode)
+
+
+# ---------------------------------------------------------
+# Window Utama Aplikasi
+# ---------------------------------------------------------
+class EVDashboardMain(QMainWindow):
+    def __init__(self, port=None):
+        super().__init__()
+        self.setWindowTitle("Smart E-Vehicle Monitoring System - Polibatam")
+        self.setStyleSheet(
+            "QMainWindow { background-color: #080d1a; }"
+            "QLabel { background: transparent; color: #f8fafc; }"
+        )
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1280, screen.width() - 40), min(820, screen.height() - 60))
+
+        self.ser = None
+        self.port_name = None
+        self.init_serial(port)
+        self.demo = self.ser is None
+
+        self.raw = dict(DEFAULT_RAW)
+        self.sim = Simulator()
+
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        self.page_auth = AuthPage(self.on_login_success)
+        self.page_dash = DashboardPage(self.on_logout, self.on_drive_mode_change)
+
+        self.stack.addWidget(self.page_auth)
+        self.stack.addWidget(self.page_dash)
+
+        self.stack.setCurrentWidget(self.page_auth)
+
+        self.timer = QTimer()
+        self.timer.setInterval(UPDATE_MS)
+        self.timer.timeout.connect(self.update_telemetry)
+        self.timer.start()
+
+        self.clock_timer = QTimer()
+        self.clock_timer.setInterval(1000)
+        self.clock_timer.timeout.connect(self.update_clock)
+        self.clock_timer.start()
+
+    def init_serial(self, port=None):
+        if serial is None:
+            return
+        if port is None:
+            for p in list_ports.comports():
+                text = f"{p.description} {p.manufacturer or ''}"
+                if any(k in text for k in ["STM", "CH340", "CP210"]):
+                    port = p.device
+                    break
+        if port is None:
+            return
+        try:
+            self.ser = serial.Serial(port, BAUDRATE, timeout=0.05)
+            self.port_name = port
+        except Exception:
+            pass
+
+    def read_serial(self):
+        packet = None
+        try:
+            while self.ser and self.ser.in_waiting:
+                line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                if line:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        packet = obj
+        except Exception:
+            self.ser = None
+        return packet
+
+    def on_login_success(self, user_info):
+        self.page_dash.lbl_user.setText(user_info)
+        self.stack.setCurrentWidget(self.page_dash)
+
+    def on_logout(self):
+        self.stack.setCurrentWidget(self.page_auth)
+
+    def on_drive_mode_change(self, mode_key):
+        self.raw["drive_mode"] = mode_key
+        self.sim.drive_mode = mode_key
+
+    def update_clock(self):
+        now = datetime.datetime.now()
+        time_str = now.strftime("%H:%M")
+        self.page_dash.lbl_time.setText(time_str)
+
+    def update_telemetry(self):
+        if self.demo:
+            self.raw.update(self.sim.step())
+        elif self.ser:
+            packet = self.read_serial()
+            if packet:
+                self.raw.update(packet)
+
+        if self.stack.currentWidget() == self.page_dash:
+            self.page_dash.render(build_view(self.raw))
+
+
+if __name__ == "__main__":
+    port_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    app = QApplication(sys.argv)
+    window = EVDashboardMain(port_arg)
+    window.show()
+    sys.exit(app.exec_())
