@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer, Qt, QRectF, QPointF
 from PyQt5.QtGui import (
     QFont, QPainter, QColor, QPen, QPixmap, QPainterPath,
-    QLinearGradient, QPolygonF
+    QLinearGradient
 )
 
 # ---------------------------------------------------------
@@ -37,13 +37,10 @@ LOGO_TRE = "logo_tre.png"
 
 BAUDRATE = 115200
 UPDATE_MS = 100            # 10 Hz
-HISTORY_LEN = 100          # titik grafik (10 detik)
 
 MAX_SPEED = 180
 ZONE_WARN = 120
 ZONE_RED = 150
-TIRE_MIN, TIRE_MAX = 33, 37
-POWER_LOW, POWER_HIGH = 2.5, 4.0
 FUEL_CAPACITY_LITERS = 45.0
 
 GREEN, AMBER, RED, CYAN, GRAY = "#22c55e", "#f59e0b", "#ef4444", "#38bdf8", "#94a3b8"
@@ -66,14 +63,10 @@ DRIVE_MODES = {
     "ICE": ("ICE MODE", RED, "100% Mesin Pembakaran Dalam", "#450a0a", "#991b1b"),
 }
 
-TIRE_NAMES = ["FL", "FR", "RL", "RR"]
-HARI = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
-BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
-         "Agustus", "September", "Oktober", "November", "Desember"]
-
 DEFAULT_RAW = {
-    "speed": 51.0, "voltage": 76.6, "current": 19.9, "temp": 28.0,
-    "fuel_level": 85.0, "tpms": [34, 34, 35, 35], "tpms_temp": [28, 28, 28, 28],
+    "speed": 51.0, "voltage": 76.6, "current": 2.7, "temp": 28.0, "bat_temp": 32.0,
+    "soh": 94, "est_range": 120, "fuel_level": 81.0,
+    "tpms": [33, 33, 37, 37], "tpms_temp": [28, 28, 28, 28],
     "door": False, "belt": True, "drive_mode": "EV", "accel_state": "DECEL"
 }
 
@@ -90,8 +83,8 @@ def font(px, bold=False):
     return f
 
 
-def card_style(border="#1e293b", width=1, radius=16):
-    return (f"QFrame#card {{ background-color: #0f172a; "
+def card_style(border="#1e293b", width=1, radius=12):
+    return (f"QFrame#card {{ background-color: #0b1324; "
             f"border: {width}px solid {border}; border-radius: {radius}px; }}")
 
 
@@ -158,16 +151,16 @@ def derive_energy_mode(current, speed, drive_mode, soc, accel_state="HOLD"):
 
 def build_view(raw):
     d = dict(raw)
-    v = float(d.get("voltage", 0))
-    i = float(d.get("current", 0))
-    spd = float(d.get("speed", 0))
+    v = float(d.get("voltage", 76.6))
+    i = float(d.get("current", 2.7))
+    spd = float(d.get("speed", 51.0))
     dm = d.get("drive_mode", "EV")
     soc = int(max(0, min(100, (v - 60.0) / (84.0 - 60.0) * 100)))
     accel = d.get("accel_state", "HOLD")
 
     d.setdefault("power", round(v * abs(i) / 1000.0, 2))
     d["soc"] = soc
-    d["fuel"] = float(d.get("fuel_level", 85.0))
+    d["fuel"] = float(d.get("fuel_level", 81.0))
     d["energy_mode"] = derive_energy_mode(i, spd, dm, soc, accel)
     return d
 
@@ -180,7 +173,7 @@ class Simulator:
         self.speed = 51.0
         self.target = 51.0
         self.temp = 28.0
-        self.fuel = 85.0
+        self.fuel = 81.0
         self.tick = 0
         self.drive_mode = "EV"
 
@@ -196,9 +189,9 @@ class Simulator:
         self.speed = max(0.0, self.speed + accel_val)
         
         mult = 1.0 if self.drive_mode == "EV" else (0.4 if self.drive_mode == "HYBRID" else 0.05)
-        current = (self.speed * 0.3 + accel_val * 6 + random.uniform(-0.2, 0.2)) * mult
-        current = max(-15.0, min(35.0, current))
-        voltage = 76.6 - 0.02 * current + random.uniform(-0.05, 0.05)
+        current = (self.speed * 0.08 + random.uniform(-0.1, 0.1)) * mult
+        current = max(0.0, min(120.0, current))
+        voltage = 76.6 - 0.01 * current + random.uniform(-0.02, 0.02)
         
         if self.drive_mode in ["ICE", "HYBRID"] and self.speed > 0:
             self.fuel = max(5.0, self.fuel - 0.005)
@@ -206,17 +199,73 @@ class Simulator:
         return {
             "speed": round(self.speed, 1), "voltage": round(voltage, 1),
             "current": round(current, 1), "temp": round(self.temp, 1),
+            "bat_temp": 32.0, "soh": 94, "est_range": 120,
             "fuel_level": round(self.fuel, 1),
-            "tpms": [34, 34, 35, 35], "tpms_temp": [28, 28, 28, 28],
+            "tpms": [33, 33, 37, 37], "tpms_temp": [28, 28, 28, 28],
             "door": False, "belt": True, "drive_mode": self.drive_mode,
             "accel_state": accel_state
         }
 
 
 # ---------------------------------------------------------
-# Custom Widgets
+# Custom Widgets Ukuran Besar
 # ---------------------------------------------------------
+class ArcMeter(QWidget):
+    """Gauge Busur Ukuran Besar"""
+    def __init__(self, val_unit="A", max_val=120, color=CYAN, parent=None):
+        super().__init__(parent)
+        self.value = 0.0
+        self.val_unit = val_unit
+        self.max_val = max_val
+        self.color = QColor(color)
+        self.setMinimumSize(170, 130)
+
+    def set_value(self, v):
+        self.value = max(0.0, min(float(self.max_val), v))
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+
+        w, h = self.width(), self.height()
+        cx, cy = w / 2, h - 22
+        r = min(w / 2 - 18, h - 32)
+        rect = QRectF(cx - r, cy - r, 2 * r, 2 * r)
+
+        p.setPen(QPen(QColor("#1e293b"), 10, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(rect, 0 * 16, 180 * 16)
+
+        if self.value > 0.05:
+            ratio = self.value / self.max_val
+            span_deg = ratio * 180
+            p.setPen(QPen(self.color, 10, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(rect, 180 * 16, int(-span_deg * 16))
+
+            # Dot Ujung Arc
+            angle_rad = math.radians(180 - span_deg)
+            dot_x = cx + r * math.cos(angle_rad)
+            dot_y = cy - r * math.sin(angle_rad)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#ffffff"))
+            p.drawEllipse(QPointF(dot_x, dot_y), 6, 6)
+
+        p.setPen(QColor("#ffffff"))
+        p.setFont(font(18, True))
+        p.drawText(QRectF(0, cy - 30, w, 24), Qt.AlignCenter, f"{self.value:.1f} {self.val_unit}")
+
+        p.setPen(QColor(GRAY))
+        p.setFont(font(10))
+        p.drawText(QRectF(0, cy - 4, w, 16), Qt.AlignCenter, self.val_unit)
+
+        p.setFont(font(10))
+        p.drawText(QRectF(cx - r - 8, cy + 2, 40, 16), Qt.AlignLeft, "0" + self.val_unit)
+        p.drawText(QRectF(cx + r - 32, cy + 2, 40, 16), Qt.AlignRight, f"{self.max_val}" + self.val_unit)
+
+
 class SpeedGauge(QWidget):
+    """Speedometer Dial 270 Derajat"""
     START = 225.0
     SPAN = 270.0
 
@@ -284,6 +333,7 @@ class SpeedGauge(QWidget):
 
 
 class FilledAreaChart(QWidget):
+    """Grafik Total Power Draw"""
     def __init__(self, color=CYAN, parent=None):
         super().__init__(parent)
         self.values = [0.2, 0.4, 0.5, 0.4, 0.6, 0.8, 0.7, 0.9, 1.2, 1.1, 1.4, 1.52]
@@ -327,18 +377,17 @@ class FilledAreaChart(QWidget):
 
 
 class CarCenterView(QWidget):
+    """Panel Tengah Mobil"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.soc = 76
-        self.temp = 28
+        self.tpms = [33, 33, 37, 37]
         self.car_pixmap = load_pixmap(CAR_IMAGES)
         self._scaled = None
         self._scaled_h = -1
-        self.setMinimumSize(220, 260)
+        self.setMinimumSize(250, 300)
 
-    def set_data(self, soc, temp):
-        self.soc = soc
-        self.temp = temp
+    def set_data(self, tpms):
+        self.tpms = tpms
         self.update()
 
     def paintEvent(self, event):
@@ -348,7 +397,7 @@ class CarCenterView(QWidget):
         w, h = self.width(), self.height()
         cx = w / 2
         top = 10
-        ih = max(100, int(h - 20))
+        ih = max(140, int(h - 20))
 
         if self.car_pixmap:
             if self._scaled_h != ih:
@@ -361,37 +410,13 @@ class CarCenterView(QWidget):
             p.setPen(QPen(QColor("#334155"), 2))
             p.drawRoundedRect(QRectF(cx - iw * 0.25, top + ih * 0.1, iw * 0.5, ih * 0.75), 20, 20)
 
-        # Bar Kiri - Battery Level
-        bx_left = cx - iw/2 - 30
-        if bx_left > 10:
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor("#1e293b"))
-            p.drawRoundedRect(QRectF(bx_left, top + 40, 6, ih - 80), 3, 3)
-            fill_h = ((ih - 80) * self.soc) / 100.0
-            p.setBrush(QColor(CYAN))
-            p.drawRoundedRect(QRectF(bx_left, top + 40 + (ih - 80 - fill_h), 6, fill_h), 3, 3)
-
-            p.setPen(QColor("#ffffff"))
-            p.setFont(font(10, True))
-            p.drawText(QRectF(bx_left - 20, top + 15, 46, 20), Qt.AlignCenter, "🔋")
-            p.drawText(QRectF(bx_left - 20, top + 32, 46, 20), Qt.AlignCenter, f"{self.soc}%")
-            p.drawText(QRectF(bx_left - 20, top + ih - 35, 46, 20), Qt.AlignCenter, f"{self.soc}%")
-
-        # Bar Kanan - Temperature
-        bx_right = cx + iw/2 + 24
-        if bx_right < w - 20:
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor("#1e293b"))
-            p.drawRoundedRect(QRectF(bx_right, top + 40, 6, ih - 80), 3, 3)
-            fill_h_t = ((ih - 80) * self.temp) / 60.0
-            p.setBrush(QColor(CYAN))
-            p.drawRoundedRect(QRectF(bx_right, top + 40 + (ih - 80 - fill_h_t), 6, fill_h_t), 3, 3)
-
-            p.setPen(QColor("#ffffff"))
-            p.setFont(font(10, True))
-            p.drawText(QRectF(bx_right - 20, top + 15, 46, 20), Qt.AlignCenter, "🌡️")
-            p.drawText(QRectF(bx_right - 20, top + 32, 46, 20), Qt.AlignCenter, f"{int(self.temp)}°C")
-            p.drawText(QRectF(bx_right - 20, top + ih - 35, 46, 20), Qt.AlignCenter, f"{int(self.temp)}°C")
+        # Angka TPMS Hijau
+        p.setPen(QColor(GREEN))
+        p.setFont(font(14, True))
+        p.drawText(QRectF(cx - iw/2 - 30, top + ih * 0.22, 28, 18), Qt.AlignCenter, str(self.tpms[0]))
+        p.drawText(QRectF(cx + iw/2 + 2, top + ih * 0.22, 28, 18), Qt.AlignCenter, str(self.tpms[1]))
+        p.drawText(QRectF(cx - iw/2 - 30, top + ih * 0.68, 28, 18), Qt.AlignCenter, str(self.tpms[2]))
+        p.drawText(QRectF(cx + iw/2 + 2, top + ih * 0.68, 28, 18), Qt.AlignCenter, str(self.tpms[3]))
 
 
 class BigBatteryCard(QFrame):
@@ -401,17 +426,17 @@ class BigBatteryCard(QFrame):
         self.setStyleSheet(card_style())
         
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setContentsMargins(18, 16, 18, 16)
         
         lbl_t = QLabel("BATTERY SYSTEM")
         lbl_t.setStyleSheet(f"color: {GRAY}; font-size: 11px; font-weight: bold;")
         
         row = QHBoxLayout()
         self.lbl_val = QLabel("69%")
-        self.lbl_val.setStyleSheet("color: #ffffff; font-size: 42px; font-weight: bold;")
+        self.lbl_val.setStyleSheet("color: #ffffff; font-size: 46px; font-weight: bold;")
         
         self.bat_bar = QProgressBar()
-        self.bat_bar.setFixedHeight(28)
+        self.bat_bar.setFixedHeight(32)
         self.bat_bar.setRange(0, 100)
         self.bat_bar.setValue(69)
         self.bat_bar.setTextVisible(False)
@@ -419,7 +444,7 @@ class BigBatteryCard(QFrame):
             QProgressBar {
                 border: 2px solid #22c55e;
                 border-radius: 6px;
-                background-color: #0f172a;
+                background-color: #0b1324;
                 padding: 2px;
             }
             QProgressBar::chunk {
@@ -429,7 +454,7 @@ class BigBatteryCard(QFrame):
         """)
 
         row.addWidget(self.lbl_val)
-        row.addSpacing(20)
+        row.addSpacing(18)
         row.addWidget(self.bat_bar, stretch=1)
         
         lay.addWidget(lbl_t)
@@ -443,18 +468,18 @@ class LinearProgressCard(QFrame):
         self.setStyleSheet(card_style())
         
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setContentsMargins(18, 14, 18, 14)
         
         lbl_t = QLabel(title.upper())
-        lbl_t.setStyleSheet(f"color: {GRAY}; font-size: 10px; font-weight: bold;")
+        lbl_t.setStyleSheet(f"color: {GRAY}; font-size: 11px; font-weight: bold;")
         
-        self.lbl_val = QLabel("69%")
-        self.lbl_val.setStyleSheet("color: #ffffff; font-size: 26px; font-weight: bold;")
+        self.lbl_val = QLabel("81%")
+        self.lbl_val.setStyleSheet("color: #ffffff; font-size: 32px; font-weight: bold;")
         
         self.pbar = QProgressBar()
         self.pbar.setFixedHeight(8)
         self.pbar.setRange(0, 100)
-        self.pbar.setValue(69)
+        self.pbar.setValue(81)
         self.pbar.setTextVisible(False)
         self.pbar.setStyleSheet(f"""
             QProgressBar {{
@@ -469,10 +494,10 @@ class LinearProgressCard(QFrame):
         """)
 
         sub_row = QHBoxLayout()
-        self.lbl_sub_l = QLabel("69% SoC")
-        self.lbl_sub_l.setStyleSheet(f"color: {GRAY}; font-size: 11px;")
+        self.lbl_sub_l = QLabel("Tangki Bensin")
+        self.lbl_sub_l.setStyleSheet(f"color: {GRAY}; font-size: 12px;")
         self.lbl_sub_r = QLabel(sub_right)
-        self.lbl_sub_r.setStyleSheet(f"color: {GRAY}; font-size: 11px;")
+        self.lbl_sub_r.setStyleSheet(f"color: {GRAY}; font-size: 12px;")
         sub_row.addWidget(self.lbl_sub_l)
         sub_row.addStretch()
         sub_row.addWidget(self.lbl_sub_r)
@@ -636,7 +661,7 @@ class DashboardPage(QWidget):
         v_title.addWidget(lbl_title)
         v_title.addWidget(lbl_sub)
 
-        # Mode Selector (EV, HEV, ICE)
+        # Mode Selector
         mode_box = QHBoxLayout()
         mode_box.setSpacing(4)
         self.btn_ev = QPushButton("⚡ EV")
@@ -681,83 +706,112 @@ class DashboardPage(QWidget):
 
         root.addWidget(header)
 
-        # 2. Main 3 Column Layout
+        # 2. Main 3 Column Layout dengan Pembagian Stretch Baru
         main_layout = QHBoxLayout()
-        main_layout.setSpacing(10)
+        main_layout.setSpacing(12)
 
-        # --- KOLOM 1: Left Cards ---
+        # --- KOLOM 1: Panel Kiri ---
         col1 = QVBoxLayout()
-        col1.setSpacing(8)
+        col1.setSpacing(10)
 
         self.card_bat_top = BigBatteryCard()
 
-        row_3 = QFrame()
-        row_3.setObjectName("card")
-        row_3.setStyleSheet(card_style())
-        r3_lay = QHBoxLayout(row_3)
-        r3_lay.setContentsMargins(10, 8, 10, 8)
+        card_params = self.make_card()
+        cp_lay = QVBoxLayout(card_params)
+        cp_lay.setContentsMargins(16, 12, 16, 12)
 
-        # Card 1: Tangki Bensin
-        c1 = QVBoxLayout()
-        lbl_c1_t = QLabel("TANGKI BENSIN")
-        lbl_c1_t.setStyleSheet(f"color: {GRAY}; font-size: 9px; font-weight: bold;")
-        self.lbl_c1_v = QLabel("76.6 V")
-        self.lbl_c1_v.setStyleSheet("color: #ffffff; font-size: 18px; font-weight: bold;")
-        self.lbl_c1_s = QLabel("Tegangan\nNormal")
-        self.lbl_c1_s.setStyleSheet(f"color: {GREEN}; font-size: 10px;")
-        c1.addWidget(lbl_c1_t)
-        c1.addWidget(self.lbl_c1_v)
-        c1.addWidget(self.lbl_c1_s)
+        lbl_cp_t = QLabel("BATTERY PARAMETERS")
+        lbl_cp_t.setStyleSheet(f"color: {GRAY}; font-size: 11px; font-weight: bold;")
 
-        # Card 2: Tegangan
-        c2 = QVBoxLayout()
-        lbl_c2_t = QLabel("TEGANGAN")
-        lbl_c2_t.setStyleSheet(f"color: {GRAY}; font-size: 9px; font-weight: bold;")
-        self.lbl_c2_v = QLabel("76.6 V")
-        self.lbl_c2_v.setStyleSheet(f"color: {GREEN}; font-size: 18px; font-weight: bold;")
-        self.lbl_c2_s = QLabel("Tegangan\nBaterai Utama")
-        self.lbl_c2_s.setStyleSheet(f"color: {GRAY}; font-size: 10px;")
-        c2.addWidget(lbl_c2_t)
-        c2.addWidget(self.lbl_c2_v)
-        c2.addWidget(self.lbl_c2_s)
+        row_gauges = QHBoxLayout()
 
-        # Card 3: Arus
-        c3 = QVBoxLayout()
-        lbl_c3_t = QLabel("ARUS")
-        lbl_c3_t.setStyleSheet(f"color: {GRAY}; font-size: 9px; font-weight: bold;")
-        self.lbl_c3_v = QLabel("19.9 A")
-        self.lbl_c3_v.setStyleSheet("color: #ffffff; font-size: 18px; font-weight: bold;")
-        self.lbl_c3_s = QLabel("Arus\nDischarging")
-        self.lbl_c3_s.setStyleSheet(f"color: {AMBER}; font-size: 10px;")
-        c3.addWidget(lbl_c3_t)
-        c3.addWidget(self.lbl_c3_v)
-        c3.addWidget(self.lbl_c3_s)
+        # Arus Box
+        v_i = QVBoxLayout()
+        hdr_i = QHBoxLayout()
+        lbl_i_t = QLabel("Arus\nSENSOR/ARUS")
+        lbl_i_t.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold;")
+        chip_i = QLabel("● NORMAL")
+        chip_i.setStyleSheet(f"color: {GREEN}; font-size: 9px; font-weight: bold; background: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px;")
+        hdr_i.addWidget(lbl_i_t)
+        hdr_i.addStretch()
+        hdr_i.addWidget(chip_i)
 
-        r3_lay.addLayout(c1)
-        r3_lay.addLayout(c2)
-        r3_lay.addLayout(c3)
+        self.meter_current = ArcMeter("A", 120, CYAN)
+        v_i.addLayout(hdr_i)
+        v_i.addWidget(self.meter_current)
 
-        self.card_bat_soc = LinearProgressCard("BATTERY SYSTEM", "#22c55e", "")
-        self.card_fuel_tank = LinearProgressCard("FUEL TANK", "#38bdf8", "38.2 L / 45.0 L")
+        # Tegangan Box
+        v_v = QVBoxLayout()
+        hdr_v = QHBoxLayout()
+        lbl_v_t = QLabel("Tegangan\nSENSOR/TEGANGAN")
+        lbl_v_t.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold;")
+        chip_v = QLabel("● NORMAL")
+        chip_v.setStyleSheet(f"color: {GREEN}; font-size: 9px; font-weight: bold; background: rgba(34, 197, 94, 0.15); padding: 4px 8px; border-radius: 4px;")
+        hdr_v.addWidget(lbl_v_t)
+        hdr_v.addStretch()
+        hdr_v.addWidget(chip_v)
+
+        self.meter_voltage = ArcMeter("V", 120, CYAN)
+        v_v.addLayout(hdr_v)
+        v_v.addWidget(self.meter_voltage)
+
+        row_gauges.addLayout(v_i)
+        row_gauges.addLayout(v_v)
+
+        cp_lay.addWidget(lbl_cp_t)
+        cp_lay.addLayout(row_gauges)
+
+        # Health & Range Box
+        row_health = QHBoxLayout()
+        row_health.setSpacing(10)
+
+        card_soh = self.make_card()
+        c_soh_l = QVBoxLayout(card_soh)
+        c_soh_l.setContentsMargins(16, 12, 16, 12)
+        lbl_soh_t = QLabel("BATTERY HEALTH")
+        lbl_soh_t.setStyleSheet(f"color: {GRAY}; font-size: 11px; font-weight: bold;")
+        lbl_soh_v = QLabel("🔋 94% SOH")
+        lbl_soh_v.setStyleSheet(f"color: {GREEN}; font-size: 18px; font-weight: bold;")
+        lbl_soh_s = QLabel("State of Health")
+        lbl_soh_s.setStyleSheet(f"color: {GRAY}; font-size: 10px;")
+        c_soh_l.addWidget(lbl_soh_t)
+        c_soh_l.addWidget(lbl_soh_v)
+        c_soh_l.addWidget(lbl_soh_s)
+
+        card_range = self.make_card()
+        c_rng_l = QVBoxLayout(card_range)
+        c_rng_l.setContentsMargins(16, 12, 16, 12)
+        lbl_rng_t = QLabel("DAYA MAKSIMAL")
+        lbl_rng_t.setStyleSheet(f"color: {GRAY}; font-size: 11px; font-weight: bold;")
+        lbl_rng_v = QLabel("📍 EST. RANGE\n120 km")
+        lbl_rng_v.setStyleSheet("color: #ffffff; font-size: 17px; font-weight: bold;")
+        c_rng_l.addWidget(lbl_rng_t)
+        c_rng_l.addWidget(lbl_rng_v)
+
+        row_health.addWidget(card_soh)
+        row_health.addWidget(card_range)
+
+        # Fuel Tank Box
+        self.card_fuel_tank = LinearProgressCard("FUEL TANK", "#38bdf8", "36.6 L / 45.0 L")
 
         col1.addWidget(self.card_bat_top)
-        col1.addWidget(row_3)
-        col1.addWidget(self.card_bat_soc)
+        col1.addWidget(card_params)
+        col1.addLayout(row_health)
         col1.addWidget(self.card_fuel_tank)
 
-        # --- KOLOM 2: Middle Whole Car & Controls ---
+        # --- KOLOM 2: Panel Tengah ---
         col2_card = self.make_card()
         col2_lay = QVBoxLayout(col2_card)
         col2_lay.setContentsMargins(12, 10, 12, 10)
 
         nav_row = QHBoxLayout()
-        nav_row.setSpacing(20)
+        nav_row.setSpacing(16)
         lbl_eng = QLabel("Engine")
-        lbl_eng.setStyleSheet(f"color: {GRAY}; font-size: 12px;")
+        lbl_eng.setStyleSheet(f"color: {GRAY}; font-size: 11px;")
         lbl_car = QLabel("Whole Car")
-        lbl_car.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold; border-bottom: 2px solid #ffffff;")
+        lbl_car.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold; border-bottom: 2px solid #ffffff;")
         lbl_whl = QLabel("Wheels")
-        lbl_whl.setStyleSheet(f"color: {GRAY}; font-size: 12px;")
+        lbl_whl.setStyleSheet(f"color: {GRAY}; font-size: 11px;")
         nav_row.addStretch()
         nav_row.addWidget(lbl_eng)
         nav_row.addWidget(lbl_car)
@@ -767,26 +821,26 @@ class DashboardPage(QWidget):
         self.center_car = CarCenterView()
 
         ctrl_grid = QGridLayout()
-        ctrl_grid.setSpacing(10)
+        ctrl_grid.setSpacing(8)
 
         lbl_vol = QLabel("🔊\n45%")
         lbl_vol.setAlignment(Qt.AlignCenter)
-        lbl_vol.setStyleSheet("color: #ffffff; font-size: 11px;")
+        lbl_vol.setStyleSheet("color: #ffffff; font-size: 10px;")
 
         btn_auto = QPushButton("AUTO")
-        btn_auto.setFont(font(10, True))
-        btn_auto.setFixedSize(54, 54)
+        btn_auto.setFont(font(9, True))
+        btn_auto.setFixedSize(48, 48)
         btn_auto.setStyleSheet("""
             QPushButton {
                 background-color: #ec4899;
                 color: white;
-                border-radius: 27px;
+                border-radius: 24px;
             }
         """)
 
         lbl_temp = QLabel("♨️\n20°C")
         lbl_temp.setAlignment(Qt.AlignCenter)
-        lbl_temp.setStyleSheet("color: #ffffff; font-size: 11px;")
+        lbl_temp.setStyleSheet("color: #ffffff; font-size: 10px;")
 
         ctrl_grid.addWidget(lbl_vol, 0, 0)
         ctrl_grid.addWidget(btn_auto, 0, 1, Qt.AlignCenter)
@@ -796,7 +850,7 @@ class DashboardPage(QWidget):
         col2_lay.addWidget(self.center_car, stretch=1)
         col2_lay.addLayout(ctrl_grid)
 
-        # --- KOLOM 3: Right Speedometer & Total Power Draw ---
+        # --- KOLOM 3: Panel Kanan ---
         col3_layout = QVBoxLayout()
         col3_layout.setSpacing(8)
 
@@ -834,9 +888,10 @@ class DashboardPage(QWidget):
         col3_layout.addWidget(gauge_card, stretch=2)
         col3_layout.addWidget(pwr_card, stretch=1)
 
-        main_layout.addLayout(col1, stretch=1)
-        main_layout.addWidget(col2_card, stretch=1)
-        main_layout.addLayout(col3_layout, stretch=1)
+        # Penyesuaian Rasio Stretch Layout Utama (5 : 5 : 4)
+        main_layout.addLayout(col1, stretch=5)
+        main_layout.addWidget(col2_card, stretch=5)
+        main_layout.addLayout(col3_layout, stretch=4)
 
         root.addLayout(main_layout, stretch=1)
 
@@ -923,9 +978,10 @@ class DashboardPage(QWidget):
         cur = float(d["current"])
         soc = int(d["soc"])
         temp = float(d["temp"])
-        fuel = float(d.get("fuel", 85.0))
+        fuel = float(d.get("fuel", 81.0))
         pwr = float(d["power"])
         drive_mode = d.get("drive_mode", "EV")
+        tpms = d.get("tpms", [33, 33, 37, 37])
 
         self.gauge.set_value(speed)
 
@@ -933,11 +989,8 @@ class DashboardPage(QWidget):
         self.card_bat_top.lbl_val.setText(f"{soc}%")
         self.card_bat_top.bat_bar.setValue(soc)
 
-        self.lbl_c1_v.setText(f"{volt:.1f} V")
-        self.lbl_c2_v.setText(f"{volt:.1f} V")
-        self.lbl_c3_v.setText(f"{cur:.1f} A")
-
-        self.card_bat_soc.update_data(soc, f"{soc}% SoC")
+        self.meter_voltage.set_value(volt)
+        self.meter_current.set_value(cur)
         
         fuel_liters = round((fuel / 100.0) * FUEL_CAPACITY_LITERS, 1)
         self.card_fuel_tank.update_data(int(fuel), "Tangki Bensin", f"{fuel_liters} L / {FUEL_CAPACITY_LITERS} L")
@@ -948,7 +1001,7 @@ class DashboardPage(QWidget):
         self.chart.set_values(list(self.power_history))
 
         # Update Center View
-        self.center_car.set_data(soc, temp)
+        self.center_car.set_data(tpms)
 
         # Update Bottom Pills
         em_key = d.get("energy_mode", "IDLE")
@@ -959,7 +1012,6 @@ class DashboardPage(QWidget):
 
         self.pill_bat.setText(f"⚡  KONDISI BATERAI: {em_txt}")
         
-        # PERBAIKAN: Pembaruan visual Pill Mode Penggerak real-time
         self.update_mode_pill(drive_mode)
         self.btn_ev.setChecked(drive_mode == "EV")
         self.btn_hybrid.setChecked(drive_mode == "HYBRID")
@@ -978,7 +1030,7 @@ class EVDashboardMain(QMainWindow):
             "QLabel { background: transparent; color: #f8fafc; }"
         )
         screen = QApplication.primaryScreen().availableGeometry()
-        self.resize(min(1280, screen.width() - 40), min(820, screen.height() - 60))
+        self.resize(min(1360, screen.width() - 40), min(860, screen.height() - 60))
 
         self.ser = None
         self.port_name = None
