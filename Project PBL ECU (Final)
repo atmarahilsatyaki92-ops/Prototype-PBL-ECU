@@ -51,9 +51,26 @@ FUEL_CAPACITY_LITERS = 45.0
 MAX_RANGE_KM = 200.0
 VOLT_MAX_SCALE = 90
 
+# --- Parameter model energi (dipakai simulator & estimasi jarak) ---
+BATTERY_AH = 100.0          # kapasitas pack baterai (Ah)
+EV_RANGE_FULL_KM = 120.0    # jarak tempuh listrik saat SOC 100%
+FUEL_KM_PER_L = 10.0        # konsumsi bensin (km per liter)
+DEMO_SPEEDUP = 25.0         # percepatan waktu simulator supaya perubahan terlihat cepat
+
 # Palet: satu warna aksen (CYAN). Hijau/amber/merah hanya untuk STATUS.
 GREEN, AMBER, RED, CYAN, GRAY = "#22c55e", "#f59e0b", "#ef4444", "#38bdf8", "#94a3b8"
 MUTED = "#475569"
+
+# --- Sensor oksigen wideband: AFR (rasio udara : bahan bakar, bensin) ---
+STOICH_AFR = 14.7                       # campuran ideal (lambda = 1.00)
+AFR_SCALE_MIN, AFR_SCALE_MAX = 10.0, 20.0
+AFR_BANDS = [                           # (batas bawah, batas atas, status, warna)
+    (0.0, 12.0, "SANGAT KAYA", RED),
+    (12.0, 14.0, "KAYA", AMBER),
+    (14.0, 15.4, "IDEAL", GREEN),
+    (15.4, 17.0, "MISKIN", AMBER),
+    (17.0, 99.0, "SANGAT MISKIN", RED),
+]
 
 # skema pill: (background, teks, border)
 NEUTRAL_SCHEME = ("#0d1628", "#cbd5e1", "#1e293b")
@@ -73,10 +90,11 @@ MODE_ENERGY_ICE = {
 }
 
 DEFAULT_RAW = {
-    "speed": 61.0, "voltage": 76.6, "current": 0.2, "temp": 28.0, "bat_temp": 32.0,
-    "soh": 94, "est_range": 120, "fuel_level": 77.0,
+    "speed": 61.0, "voltage": 76.6, "current": 0.2, "ambient_temp": 31.0, "bat_temp": 32.0,
+    "soh": 94, "fuel_level": 77.0,
     "tpms": [33, 33, 37, 37], "tpms_temp": [28, 28, 28, 28],
-    "door": False, "belt": True, "drive_mode": "ICE", "accel_state": "HOLD",
+    "doors": [False, False, False, False], "door": False, "belt": True, "afr": None,
+    "drive_mode": "ICE", "accel_state": "HOLD",
     "gear": "D"
 }
 
@@ -307,14 +325,61 @@ def build_view(raw):
     i = float(d.get("current", 0.2))
     spd = float(d.get("speed", 61.0))
     dm = d.get("drive_mode", "ICE")
-    soc = int(max(0, min(100, (v - 60.0) / (84.0 - 60.0) * 100)))
     accel = d.get("accel_state", "HOLD")
+    fuel = float(d.get("fuel_level", 77.0))
+
+    # SOC: pakai nilai dari firmware/simulator bila ada ("soc"),
+    # kalau tidak ada diperkirakan kasar dari tegangan.
+    if "soc" in d:
+        soc = int(max(0, min(100, round(float(d["soc"])))))
+    else:
+        soc = int(max(0, min(100, (v - 60.0) / (84.0 - 60.0) * 100)))
+
+    # Estimasi jarak: pakai "est_range" dari firmware bila ada,
+    # kalau tidak dihitung dari sisa baterai dan/atau bensin sesuai mode.
+    range_ev = soc / 100.0 * EV_RANGE_FULL_KM
+    full_ice = FUEL_CAPACITY_LITERS * FUEL_KM_PER_L
+    range_ice = fuel / 100.0 * full_ice
+    if dm == "EV":
+        calc_range, range_max, src = range_ev, EV_RANGE_FULL_KM, "dari baterai"
+    elif dm == "HYBRID":
+        calc_range, range_max, src = range_ev + range_ice, EV_RANGE_FULL_KM + full_ice, "baterai + bensin"
+    else:
+        calc_range, range_max, src = range_ice, full_ice, "dari bensin"
+    if "est_range" in d:
+        d["est_range"] = int(round(float(d["est_range"])))
+    else:
+        d["est_range"] = int(round(calc_range))
+    d["range_max"] = range_max
+    d["range_src"] = src
 
     d.setdefault("power", round(v * abs(i) / 1000.0, 2))
     d["soc"] = soc
-    d["fuel"] = float(d.get("fuel_level", 77.0))
+    d["fuel"] = fuel
     d["energy_mode"] = derive_energy_mode(i, spd, dm, soc, accel)
     return d
+
+
+# ---------------------------------------------------------
+# Helper sensor: AFR (oksigen), pintu
+# ---------------------------------------------------------
+DOOR_NAMES = ["Depan Kiri", "Depan Kanan", "Belakang Kiri", "Belakang Kanan"]
+
+
+def classify_afr(afr):
+    """Return (status, warna) untuk nilai AFR."""
+    for lo, hi, name, col in AFR_BANDS:
+        if lo <= afr < hi:
+            return name, col
+    return "--", GRAY
+
+
+def get_doors(d):
+    """Return [FL, FR, RL, RR] (True = terbuka). Mendukung paket lama dengan satu flag 'door'."""
+    doors = d.get("doors")
+    if isinstance(doors, (list, tuple)) and len(doors) >= 4:
+        return [bool(x) for x in doors[:4]]
+    return [False, False, False, False]
 
 
 # ---------------------------------------------------------
@@ -770,15 +835,42 @@ class ControlDock(QWidget):
 # Simulator Data
 # ---------------------------------------------------------
 class Simulator:
+    """
+    Simulator kendaraan dengan model energi sederhana:
+      - baterai terkuras oleh arus (EV paling boros, HEV sedang, ICE hampir nol)
+      - saat pengereman (DECEL) di EV/HEV terjadi regen -> baterai terisi
+      - saat ICE dan SOC < 20% generator mengisi baterai
+      - bensin terpakai menurut jarak tempuh (ICE penuh, HEV separuh, EV nol)
+      - AFR ~14.7 saat mesin hidup (campuran kaya saat akselerasi); None saat mesin mati
+    Waktu dipercepat DEMO_SPEEDUP kali supaya perubahan terlihat dalam hitungan menit.
+    Status uji (pintu, sabuk, ban, AFR) bisa diubah lewat tombol keyboard di mode demo.
+    """
+
+    TIRE_STATES = [[33, 33, 37, 37], [33, 33, 28, 37], [33, 33, 22, 37]]
+    AFR_OVERRIDES = [None, 12.8, 16.2, 18.0]      # auto, kaya, miskin, sangat miskin
+
     def __init__(self):
         self.speed = 61.0
         self.target = 61.0
-        self.temp = 28.0
+        self.ambient = 31.0
+        self.bat_temp = 32.0
         self.fuel = 77.0
+        self.soc = 69.0
         self.tick = 0
         self.drive_mode = "ICE"
         self.gear = "D"
         self.idle_counter = 0
+        # status uji
+        self.doors = [False, False, False, False]
+        self.belt = True
+        self.tire_state = 0
+        self.afr_state = 0
+
+    def cycle_tire_fault(self):
+        self.tire_state = (self.tire_state + 1) % len(self.TIRE_STATES)
+
+    def cycle_afr_override(self):
+        self.afr_state = (self.afr_state + 1) % len(self.AFR_OVERRIDES)
 
     def step(self):
         self.tick += 1
@@ -801,21 +893,67 @@ class Simulator:
             else:
                 self.gear = "P"
 
-        mult = 1.0 if self.drive_mode == "EV" else (0.4 if self.drive_mode == "HYBRID" else 0.05)
-        current = (self.speed * 0.08 + random.uniform(-0.1, 0.1)) * mult
-        current = max(0.0, min(120.0, current))
-        voltage = 76.6 - 0.01 * current + random.uniform(-0.02, 0.02)
+        # --- arus (A): positif = baterai menyuplai, negatif = baterai terisi ---
+        mode = self.drive_mode
+        if mode == "EV":
+            k, boost = 0.9, 12.0
+        elif mode == "HYBRID":
+            k, boost = 0.35, 5.0
+        else:
+            k, boost = 0.045, 0.0
+        current = self.speed * k + (boost if accel_state == "ACCEL" else 0.0) + random.uniform(-0.5, 0.5)
+        if self.speed <= 1.0:
+            current = 0.2 + random.uniform(0.0, 0.2)                       # beban aksesori saat diam
+        elif mode in ("EV", "HYBRID") and accel_state == "DECEL" and self.speed > 3.0:
+            current = -min(25.0, self.speed * 0.3)                         # regenerative braking
+        elif mode == "ICE" and self.soc < 20.0:
+            current = -6.0                                                 # generator mengisi baterai
+        if self.soc <= 0.5 and current > 0:
+            current = 0.0                                                  # baterai habis
+        current = max(-60.0, min(120.0, current))
 
-        if self.drive_mode in ["ICE", "HYBRID"] and self.speed > 0:
-            self.fuel = max(5.0, self.fuel - 0.005)
+        # --- integrasi energi baterai (waktu dipercepat) ---
+        dt_h = (UPDATE_MS / 1000.0) * DEMO_SPEEDUP / 3600.0
+        d_ah = current * dt_h * (0.7 if current < 0 else 1.0)              # efisiensi pengisian 70%
+        self.soc = max(0.0, min(100.0, self.soc - d_ah / BATTERY_AH * 100.0))
+
+        # --- bensin: pemakaian mengikuti jarak tempuh ---
+        dist_km = self.speed * dt_h
+        share = 1.0 if mode == "ICE" else (0.5 if mode == "HYBRID" else 0.0)
+        used_l = dist_km * share / FUEL_KM_PER_L
+        self.fuel = max(3.0, self.fuel - used_l / FUEL_CAPACITY_LITERS * 100.0)
+
+        # --- tegangan mengikuti SOC (+ sedikit sag saat beban) & suhu baterai mengikuti arus ---
+        voltage = 60.0 + 24.0 * self.soc / 100.0 - 0.01 * max(current, 0.0) + random.uniform(-0.02, 0.02)
+        self.bat_temp += (30.0 + abs(current) * 0.08 - self.bat_temp) * 0.01
+
+        # --- suhu lingkungan: melayang pelan di sekitar 31 C ---
+        self.ambient = max(29.0, min(34.0, self.ambient + random.uniform(-0.01, 0.01)))
+
+        # --- sensor oksigen (AFR): hanya saat mesin bensin hidup ---
+        engine_on = mode == "ICE" or (mode == "HYBRID" and (self.speed > 40.0 or accel_state == "ACCEL"))
+        if engine_on:
+            override = self.AFR_OVERRIDES[self.afr_state]
+            if override is not None:
+                afr = override + random.uniform(-0.08, 0.08)
+            else:
+                afr = STOICH_AFR + 0.25 * math.sin(self.tick * 0.45) + random.uniform(-0.08, 0.08)
+                if accel_state == "ACCEL":
+                    afr -= 1.3                                             # pengayaan campuran saat akselerasi
+            afr = round(afr, 2)
+        else:
+            afr = None
 
         return {
-            "speed": round(self.speed, 1), "voltage": round(voltage, 1),
-            "current": round(current, 1), "temp": round(self.temp, 1),
-            "bat_temp": 32.0, "soh": 94, "est_range": 120,
+            "speed": round(self.speed, 1), "voltage": round(voltage, 2),
+            "current": round(current, 1), "ambient_temp": round(self.ambient, 1),
+            "bat_temp": round(self.bat_temp, 1), "soh": 94,
+            "soc": round(self.soc, 2),
             "fuel_level": round(self.fuel, 3),
-            "tpms": [33, 33, 37, 37], "tpms_temp": [28, 28, 28, 28],
-            "door": False, "belt": True, "drive_mode": self.drive_mode,
+            "tpms": list(self.TIRE_STATES[self.tire_state]), "tpms_temp": [28, 28, 28, 28],
+            "doors": list(self.doors), "door": any(self.doors), "belt": self.belt,
+            "afr": afr,
+            "drive_mode": self.drive_mode,
             "accel_state": accel_state, "gear": self.gear
         }
 
@@ -1118,6 +1256,8 @@ class CarCenterViewDetailed(QWidget):
         self.tpms = [33, 33, 37, 37]
         self.soc = 69
         self.temp = 32            # suhu baterai
+        self.afr = None           # sensor oksigen (None = mesin mati)
+        self.doors = [False, False, False, False]
         self.speed = 61.0
         self.current_tab = "Whole Car"
         self.car_pixmap, self.car_clean = load_car()
@@ -1136,6 +1276,12 @@ class CarCenterViewDetailed(QWidget):
     def set_tab(self, tab_name):
         self.current_tab = tab_name
         self.update()
+
+    def set_sensors(self, afr, doors):
+        if afr != self.afr or doors != self.doors:
+            self.afr = afr
+            self.doors = list(doors)
+            self.update()
 
     # ---------------- helpers ----------------
     def _car(self, max_w, max_h):
@@ -1283,6 +1429,19 @@ class CarCenterViewDetailed(QWidget):
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(QRectF(ix, iy, iw, ih), 22, 22)
 
+        # penanda pintu terbuka (merah) di sisi mobil: atas = depan
+        if any(self.doors):
+            mh = ih * 0.17
+            ys = [iy + ih * 0.29, iy + ih * 0.29, iy + ih * 0.51, iy + ih * 0.51]   # FL FR RL RR
+            xs = [ix + iw * 0.08, ix + iw * 0.92, ix + iw * 0.08, ix + iw * 0.92]
+            for is_open, dx, dy in zip(self.doors, xs, ys):
+                if is_open:
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(QColor(239, 68, 68, 70))
+                    p.drawRoundedRect(QRectF(dx - 6 * k, dy - 3 * k, 12 * k, mh + 6 * k), 6 * k, 6 * k)
+                    p.setBrush(QColor(RED))
+                    p.drawRoundedRect(QRectF(dx - 2.5 * k, dy, 5 * k, mh), 2.5 * k, 2.5 * k)
+
         # bar baterai (kiri) & suhu baterai (kanan)
         bar_w = 10 * k
         bar_h = min(ih * 0.62, area_h * 0.58)
@@ -1298,11 +1457,12 @@ class CarCenterViewDetailed(QWidget):
         self._vbar(p, x_r, bar_y, bar_w, bar_h, min(60.0, self.temp) / 60.0, tmp_col,
                    "thermo", f"{int(self.temp)}°C", "SUHU BATT", k)
 
-    # ---------- TAB: ENGINE (ringkas, 2x2) ----------
+    # ---------- TAB: ENGINE (2x2 + sensor oksigen + beban) ----------
     def _paint_engine(self, p, w, h, k):
         margin = 12 * k
         gap = 10 * k
-        title_h = 30 * k
+        title_h = 28 * k
+        o2_h = 92 * k
         bar_block = 44 * k
 
         rpm = int(self.speed * 42.5)
@@ -1317,14 +1477,14 @@ class CarCenterViewDetailed(QWidget):
             ("EFISIENSI", "94.2%", GREEN, 0.942),
         ]
 
-        avail = h - margin * 2 - title_h - bar_block - gap * 2
-        card_h = max(84 * k, min(112 * k, avail / 2))
-        used = title_h + 2 * card_h + gap * 2 + bar_block
+        avail = h - margin * 2 - title_h - o2_h - bar_block - gap * 3
+        card_h = max(84 * k, min(104 * k, avail / 2))
+        used = title_h + 2 * card_h + o2_h + bar_block + gap * 3
         y0 = margin + max(0.0, (h - margin * 2 - used) / 2)
 
         p.setPen(QColor("#ffffff"))
         p.setFont(font(13, True))
-        p.drawText(QRectF(0, y0, w, 22 * k), Qt.AlignCenter, "STATUS MOTOR PENGGERAK")
+        p.drawText(QRectF(0, y0, w, 22 * k), Qt.AlignCenter, "STATUS PENGGERAK")
 
         top = y0 + title_h
         card_w = (w - margin * 2 - gap) / 2
@@ -1333,8 +1493,12 @@ class CarCenterViewDetailed(QWidget):
             ry = top + (idx // 2) * (card_h + gap)
             self._chip(p, QRectF(rx, ry, card_w, card_h), title, val, col, ratio, k)
 
-        cards_end = top + 2 * card_h + gap
-        label_y = cards_end + gap
+        # sensor oksigen (AFR) selebar panel
+        o2_y = top + 2 * card_h + gap + gap
+        self._o2_card(p, QRectF(margin, o2_y, w - margin * 2, o2_h), k)
+
+        # beban motor
+        label_y = o2_y + o2_h + gap
         by = label_y + 22 * k
 
         p.setPen(QColor(GRAY))
@@ -1355,6 +1519,75 @@ class CarCenterViewDetailed(QWidget):
             g.setColorAt(1, QColor(RED))
             p.setBrush(QBrush(g))
             p.drawRoundedRect(QRectF(margin, by, (w - margin * 2) * load, bar_h), bar_h / 2, bar_h / 2)
+
+    def _o2_card(self, p, rect, k):
+        """Kartu sensor oksigen wideband: nilai AFR, lambda, status, dan skala zona campuran."""
+        p.setPen(QPen(QColor("#1e293b"), 1))
+        p.setBrush(QColor("#0f172a"))
+        p.drawRoundedRect(rect, 10 * k, 10 * k)
+
+        x, y, w = rect.x() + 14 * k, rect.y(), rect.width() - 28 * k
+        afr = self.afr
+        if afr is None:
+            status, col, val_txt, lam_txt = "MESIN MATI", MUTED, "—", ""
+        else:
+            status, col = classify_afr(afr)
+            val_txt = f"{afr:.1f}"
+            lam_txt = f"λ {afr / STOICH_AFR:.2f}"
+
+        # judul + status
+        p.setPen(QColor(GRAY))
+        p.setFont(font(11, True))
+        p.drawText(QRectF(x, y + 9 * k, w * 0.6, 16 * k), Qt.AlignLeft | Qt.AlignVCenter, "SENSOR OKSIGEN (AFR)")
+        p.setPen(QColor(col))
+        p.drawText(QRectF(x + w * 0.4, y + 9 * k, w * 0.6, 16 * k), Qt.AlignRight | Qt.AlignVCenter, status)
+
+        # nilai besar "14.7 : 1" dan lambda
+        f_val = font(26, True)
+        p.setPen(QColor("#ffffff"))
+        p.setFont(f_val)
+        p.drawText(QRectF(x, y + 25 * k, w * 0.5, 34 * k), Qt.AlignLeft | Qt.AlignVCenter, val_txt)
+        if afr is not None:
+            vw = text_width(f_val, val_txt)
+            p.setPen(QColor(GRAY))
+            p.setFont(font(13, True))
+            p.drawText(QRectF(x + vw + 6 * k, y + 25 * k, 50 * k, 34 * k), Qt.AlignLeft | Qt.AlignVCenter, ": 1")
+            p.drawText(QRectF(x + w * 0.5, y + 25 * k, w * 0.5, 34 * k), Qt.AlignRight | Qt.AlignVCenter, lam_txt)
+
+        # skala zona campuran
+        bar_y, bar_h = y + 64 * k, 8 * k
+        span = AFR_SCALE_MAX - AFR_SCALE_MIN
+
+        def fx(v):
+            return x + (max(AFR_SCALE_MIN, min(AFR_SCALE_MAX, v)) - AFR_SCALE_MIN) / span * w
+
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(x, bar_y, w, bar_h), bar_h / 2, bar_h / 2)
+        p.save()
+        p.setClipPath(clip)
+        p.setPen(Qt.NoPen)
+        for lo, hi, _name, c in AFR_BANDS:
+            seg = QColor(c)
+            seg.setAlpha(90 if afr is not None else 40)
+            p.setBrush(seg)
+            p.drawRect(QRectF(fx(lo), bar_y, fx(hi) - fx(lo), bar_h))
+        p.restore()
+
+        # tanda campuran ideal (14.7) dan penanda nilai saat ini
+        p.setPen(QPen(QColor("#cbd5e1"), 1.2))
+        p.drawLine(QPointF(fx(STOICH_AFR), bar_y - 3 * k), QPointF(fx(STOICH_AFR), bar_y + bar_h + 3 * k))
+        if afr is not None:
+            p.setPen(QPen(QColor(col), 2 * k))
+            p.setBrush(QColor("#ffffff"))
+            p.drawEllipse(QPointF(fx(afr), bar_y + bar_h / 2), 5.5 * k, 5.5 * k)
+
+        # label skala
+        p.setPen(QColor("#64748b"))
+        p.setFont(font(9, True))
+        ly = bar_y + bar_h + 5 * k
+        p.drawText(QRectF(x, ly, 60 * k, 12 * k), Qt.AlignLeft | Qt.AlignVCenter, "KAYA")
+        p.drawText(QRectF(fx(STOICH_AFR) - 25 * k, ly, 50 * k, 12 * k), Qt.AlignCenter, "14.7")
+        p.drawText(QRectF(x + w - 60 * k, ly, 60 * k, 12 * k), Qt.AlignRight | Qt.AlignVCenter, "MISKIN")
 
     # ---------- TAB: WHEELS ----------
     def _paint_wheels(self, p, w, h, k):
@@ -1641,6 +1874,7 @@ class DashboardPage(QWidget):
         self.is_auto_ac = True
         self._chip_state = {}
         self._conn_key = None
+        self._amb_key = None
         self.init_ui()
 
     def make_card(self):
@@ -1658,6 +1892,16 @@ class DashboardPage(QWidget):
         else:
             html = f'<span style="font-size:{S(30)}px; font-weight:600; color:#ffffff;">{text}</span>'
         self.lbl_big_clock.setText(html)
+
+    def set_ambient(self, temp):
+        """Suhu lingkungan (ambient temperature sensor) di sisi kanan jam."""
+        t = int(round(temp))
+        if t == self._amb_key:
+            return
+        self._amb_key = t
+        self.lbl_ambient.setText(
+            f'<div align="right"><span style="font-size:{S(15)}px; font-weight:bold; color:#ffffff;">{t}°C</span><br>'
+            f'<span style="font-size:{S(9)}px; font-weight:bold; color:#64748b;">SUHU LUAR</span></div>')
 
     def set_connection(self, text, color):
         """Indikator sumber data di header (DEMO / COM port / TERPUTUS)."""
@@ -1869,7 +2113,27 @@ class DashboardPage(QWidget):
         self.btn_temp.clicked.connect(self.toggle_temp)
         self.btn_auto.clicked.connect(self.toggle_auto_ac)
 
-        col2_lay.addWidget(self.lbl_big_clock)
+        self.lbl_ambient = QLabel()
+        self.lbl_ambient.setTextFormat(Qt.RichText)
+        self.set_ambient(28)
+
+        # jam tepat di tengah (kiri & kanan memakai stretch sama), suhu luar di kanan
+        clock_row = QHBoxLayout()
+        clock_row.setContentsMargins(S(10), 0, S(10), 0)
+        clock_left = QWidget()
+        clock_left.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        amb_w = QWidget()
+        amb_w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        amb_l = QHBoxLayout(amb_w)
+        amb_l.setContentsMargins(0, 0, 0, 0)
+        amb_l.setSpacing(S(6))
+        amb_l.addStretch()
+        amb_l.addWidget(IconWidget("thermo", 18, GRAY))
+        amb_l.addWidget(self.lbl_ambient)
+        clock_row.addWidget(clock_left, 1)
+        clock_row.addWidget(self.lbl_big_clock, 0)
+        clock_row.addWidget(amb_w, 1)
+        col2_lay.addLayout(clock_row)
         col2_lay.addLayout(nav_row)
         col2_lay.addWidget(self.center_car, stretch=1)
         col2_lay.addWidget(self.dock)
@@ -1932,7 +2196,7 @@ class DashboardPage(QWidget):
         self.btn_tab_whl.setStyleSheet(active_style if tab_name == "Wheels" else inactive_style)
 
     def toggle_volume(self):
-        self.volume = 0 if self.volume >= 100 else self.volume + 15
+        self.volume = 0 if self.volume >= 100 else self.volume + 10
         self.btn_vol.setText(f"{self.volume}%")
 
     def toggle_temp(self):
@@ -1981,13 +2245,16 @@ class DashboardPage(QWidget):
         else:
             self.pill_bat.set_state(f"BATERAI: {em_txt}", "", NEUTRAL_SCHEME, CYAN)
 
-        # --- keamanan (pintu & sabuk) ---
-        door = bool(d.get("door", False))
+        # --- keamanan (pintu per posisi & sabuk) ---
+        flags = get_doors(d)
+        names = [n for n, f in zip(DOOR_NAMES, flags) if f]
+        door_open = any(flags) or ("doors" not in d and bool(d.get("door", False)))
+        door_sub = ", ".join(names)
         belt = bool(d.get("belt", True))
-        if door and not belt:
-            self.pill_sec.set_state("PINTU TERBUKA & SABUK BELUM DIPASANG", "", BAD_SCHEME)
-        elif door:
-            self.pill_sec.set_state("PINTU TERBUKA", "tutup pintu sebelum berkendara", BAD_SCHEME)
+        if door_open and not belt:
+            self.pill_sec.set_state("PINTU TERBUKA & SABUK BELUM DIPASANG", door_sub, BAD_SCHEME)
+        elif door_open:
+            self.pill_sec.set_state("PINTU TERBUKA", door_sub or "tutup pintu sebelum berkendara", BAD_SCHEME)
         elif not belt:
             self.pill_sec.set_state("SABUK BELUM DIPASANG", "pasang sabuk pengaman", WARN_SCHEME)
         else:
@@ -2006,14 +2273,20 @@ class DashboardPage(QWidget):
         est_range = int(d.get("est_range", 120))
         pwr = float(d.get("power", 0.0))
         bat_temp = float(d.get("bat_temp", 32.0))
+        ambient = float(d.get("ambient_temp", d.get("temp", 28.0)))
+        afr_raw = d.get("afr")
+        afr = float(afr_raw) if afr_raw is not None else None
+        doors = get_doors(d)
 
         self.gauge.set_value(speed)
         self.meter_voltage.set_value(volt)
-        self.meter_current.set_value(cur)
+        self.meter_current.set_value(abs(cur))
         self.lbl_power.setText(f"{pwr:.2f} kW")
 
         # status chip arus & tegangan
-        if cur >= 100:
+        if cur < -0.5:
+            self._set_chip(self.chip_i, "REGEN", CYAN)
+        elif cur >= 100:
             self._set_chip(self.chip_i, "TINGGI", RED)
         elif cur >= 80:
             self._set_chip(self.chip_i, "WASPADA", AMBER)
@@ -2034,9 +2307,12 @@ class DashboardPage(QWidget):
         soh_txt = "Kondisi baik" if soh >= 80 else ("Perlu dipantau" if soh >= 60 else "Perlu servis")
         self.card_energy.row_soh.update_data(soh, "State of Health", soh_txt, soh_col)
 
-        rng_col = CYAN if est_range >= 30 else (AMBER if est_range >= 15 else RED)
+        rng_max = float(d.get("range_max", MAX_RANGE_KM))
+        self.card_energy.row_range.max_value = rng_max
+        rng_ratio = est_range / rng_max if rng_max > 0 else 0.0
+        rng_col = CYAN if rng_ratio >= 0.15 else (AMBER if rng_ratio >= 0.07 else RED)
         self.card_energy.row_range.update_data(est_range, "Sisa jarak tempuh",
-                                               f"maks. {int(MAX_RANGE_KM)} km", rng_col)
+                                               d.get("range_src", ""), rng_col)
 
         fuel_liters = round((fuel / 100.0) * FUEL_CAPACITY_LITERS, 1)
         fuel_col = CYAN if fuel >= 20 else (AMBER if fuel >= 10 else RED)
@@ -2044,6 +2320,8 @@ class DashboardPage(QWidget):
                                               f"{fuel_liters} L / {FUEL_CAPACITY_LITERS} L", fuel_col)
 
         self.center_car.set_data(tpms, soc, bat_temp, speed)
+        self.center_car.set_sensors(afr, doors)
+        self.set_ambient(ambient)
 
         self.card_prnd.add_value(10 + (speed / 180.0) * 30 + random.randint(-4, 4))
         self.card_prnd.set_gear(gear)
@@ -2136,6 +2414,25 @@ class EVDashboardMain(QMainWindow):
         self.raw["drive_mode"] = mode_key
         self.sim.drive_mode = mode_key
 
+    def keyPressEvent(self, event):
+        """Tombol uji untuk mode DEMO: 1-4 pintu, B sabuk, T ban kempis, O campuran AFR."""
+        if self.demo and self.stack.currentWidget() == self.page_dash:
+            key = event.key()
+            if key in (Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4):
+                i = key - Qt.Key_1
+                self.sim.doors[i] = not self.sim.doors[i]
+                return
+            if key == Qt.Key_B:
+                self.sim.belt = not self.sim.belt
+                return
+            if key == Qt.Key_T:
+                self.sim.cycle_tire_fault()
+                return
+            if key == Qt.Key_O:
+                self.sim.cycle_afr_override()
+                return
+        super().keyPressEvent(event)
+
     def _conn_info(self):
         if self.demo:
             return "DEMO • SIMULATOR", AMBER
@@ -2148,6 +2445,9 @@ class EVDashboardMain(QMainWindow):
         time_12h = now.strftime("%I:%M %p").lstrip('0')
         self.page_dash.set_big_clock(time_12h)
         self.page_dash.set_connection(*self._conn_info())
+        self.page_dash.lbl_conn.setToolTip(
+            "Tombol uji (mode demo):\n1-4 = pintu FL/FR/RL/RR\nB = sabuk\nT = ban kempis\nO = campuran AFR"
+            if self.demo else "")
 
     def update_telemetry(self):
         if self.demo:
