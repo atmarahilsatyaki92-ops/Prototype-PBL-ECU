@@ -94,6 +94,7 @@ DEFAULT_RAW = {
     "soh": 94, "fuel_level": 77.0,
     "tpms": [33, 33, 37, 37], "tpms_temp": [28, 28, 28, 28],
     "doors": [False, False, False, False], "door": False, "belt": True, "afr": None,
+    "turn_left": False, "turn_right": False, "hazard": False,
     "drive_mode": "ICE", "accel_state": "HOLD",
     "gear": "D"
 }
@@ -865,6 +866,21 @@ class Simulator:
         self.belt = True
         self.tire_state = 0
         self.afr_state = 0
+        self.turn_left = False
+        self.turn_right = False
+        self.hazard = False
+
+    def toggle_signal(self, which):
+        if which == "left":
+            self.turn_left = not self.turn_left
+            if self.turn_left:
+                self.turn_right = False        # sein kiri & kanan tidak bisa aktif bersamaan
+        elif which == "right":
+            self.turn_right = not self.turn_right
+            if self.turn_right:
+                self.turn_left = False
+        elif which == "hazard":
+            self.hazard = not self.hazard
 
     def cycle_tire_fault(self):
         self.tire_state = (self.tire_state + 1) % len(self.TIRE_STATES)
@@ -953,6 +969,7 @@ class Simulator:
             "tpms": list(self.TIRE_STATES[self.tire_state]), "tpms_temp": [28, 28, 28, 28],
             "doors": list(self.doors), "door": any(self.doors), "belt": self.belt,
             "afr": afr,
+            "turn_left": self.turn_left, "turn_right": self.turn_right, "hazard": self.hazard,
             "drive_mode": self.drive_mode,
             "accel_state": accel_state, "gear": self.gear
         }
@@ -1025,12 +1042,90 @@ class SpeedGauge(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.value = 61.0
+        # lampu sein & hazard (kedipan dibuat di sini, ~1,5 Hz)
+        self.sig_left = False
+        self.sig_right = False
+        self.sig_hazard = False
+        self._phase = True
+        self._blink_timer = QTimer(self)
+        self._blink_timer.setInterval(330)
+        self._blink_timer.timeout.connect(self._on_blink)
+        self._blink_timer.start()
         self.setMinimumSize(S(180), S(180))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def set_value(self, v):
         self.value = max(0.0, min(float(MAX_SPEED), v))
         self.update()
+
+    def _on_blink(self):
+        self._phase = not self._phase
+        if self.sig_left or self.sig_right or self.sig_hazard:
+            self.update()
+
+    def set_signals(self, left, right, hazard):
+        left, right, hazard = bool(left), bool(right), bool(hazard)
+        if (left, right, hazard) == (self.sig_left, self.sig_right, self.sig_hazard):
+            return
+        was_active = self.sig_left or self.sig_right or self.sig_hazard
+        self.sig_left, self.sig_right, self.sig_hazard = left, right, hazard
+        if not was_active and (left or right or hazard):
+            self._phase = True              # mulai dari kondisi menyala
+            self._blink_timer.start()       # restart timer supaya kedipan tersinkron
+        self.update()
+
+    def _draw_signals(self, p, cx, cy, s):
+        """Sein kiri, hazard, sein kanan di celah bawah speedometer. Redup saat mati."""
+        u = s * 0.045
+        y = cy + s * 0.355
+        dx = s * 0.175
+        lit_left = (self.sig_left or self.sig_hazard) and self._phase
+        lit_right = (self.sig_right or self.sig_hazard) and self._phase
+        lit_haz = self.sig_hazard and self._phase
+
+        base = [(-1.0, 0.0), (-0.15, -0.8), (-0.15, -0.35), (1.0, -0.35),
+                (1.0, 0.35), (-0.15, 0.35), (-0.15, 0.8)]      # panah menunjuk ke kiri
+
+        def arrow(x, m, lit):
+            path = QPainterPath()
+            for i, (px_, py_) in enumerate(base):
+                pt = QPointF(x + m * px_ * u, y + py_ * u)
+                if i == 0:
+                    path.moveTo(pt)
+                else:
+                    path.lineTo(pt)
+            path.closeSubpath()
+            if lit:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(34, 197, 94, 55))
+                p.drawEllipse(QPointF(x, y), u * 1.6, u * 1.6)
+                p.setBrush(QColor(GREEN))
+            else:
+                p.setPen(QPen(QColor("#2a3b5c"), 1))
+                p.setBrush(QColor("#16223a"))
+            p.drawPath(path)
+
+        arrow(cx - dx, 1.0, lit_left)
+        arrow(cx + dx, -1.0, lit_right)
+
+        tri = QPainterPath()
+        tri.moveTo(cx, y - u * 1.0)
+        tri.lineTo(cx + u * 1.1, y + u * 0.8)
+        tri.lineTo(cx - u * 1.1, y + u * 0.8)
+        tri.closeSubpath()
+        if lit_haz:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(239, 68, 68, 55))
+            p.drawEllipse(QPointF(cx, y), u * 1.6, u * 1.6)
+            p.setBrush(QColor(RED))
+        else:
+            p.setPen(QPen(QColor("#2a3b5c"), 1))
+            p.setBrush(QColor("#16223a"))
+        p.drawPath(tri)
+        p.setPen(QPen(QColor("#ffffff" if lit_haz else "#334155"), max(1.5, u * 0.16),
+                      Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx, y - u * 0.35), QPointF(cx, y + u * 0.2))
+        p.drawLine(QPointF(cx, y + u * 0.5), QPointF(cx, y + u * 0.52))
 
     def _pt(self, cx, cy, rad, v):
         a = math.radians(self.START - self.SPAN * v / MAX_SPEED)
@@ -1084,6 +1179,8 @@ class SpeedGauge(QWidget):
         p.setPen(QColor(GRAY))
         p.setFont(rfont(s * 0.06, True))
         p.drawText(QRectF(0, cy + s * 0.14, w, s * 0.08), Qt.AlignCenter, "km/h")
+
+        self._draw_signals(p, cx, cy, s)
 
 
 class EnergyChart(QWidget):
@@ -2196,7 +2293,7 @@ class DashboardPage(QWidget):
         self.btn_tab_whl.setStyleSheet(active_style if tab_name == "Wheels" else inactive_style)
 
     def toggle_volume(self):
-        self.volume = 0 if self.volume >= 100 else self.volume + 10
+        self.volume = 0 if self.volume >= 100 else min(100, self.volume + 15)
         self.btn_vol.setText(f"{self.volume}%")
 
     def toggle_temp(self):
@@ -2279,6 +2376,7 @@ class DashboardPage(QWidget):
         doors = get_doors(d)
 
         self.gauge.set_value(speed)
+        self.gauge.set_signals(d.get("turn_left", False), d.get("turn_right", False), d.get("hazard", False))
         self.meter_voltage.set_value(volt)
         self.meter_current.set_value(abs(cur))
         self.lbl_power.setText(f"{pwr:.2f} kW")
@@ -2431,6 +2529,15 @@ class EVDashboardMain(QMainWindow):
             if key == Qt.Key_O:
                 self.sim.cycle_afr_override()
                 return
+            if key == Qt.Key_Q:
+                self.sim.toggle_signal("left")
+                return
+            if key == Qt.Key_E:
+                self.sim.toggle_signal("right")
+                return
+            if key == Qt.Key_H:
+                self.sim.toggle_signal("hazard")
+                return
         super().keyPressEvent(event)
 
     def _conn_info(self):
@@ -2446,7 +2553,7 @@ class EVDashboardMain(QMainWindow):
         self.page_dash.set_big_clock(time_12h)
         self.page_dash.set_connection(*self._conn_info())
         self.page_dash.lbl_conn.setToolTip(
-            "Tombol uji (mode demo):\n1-4 = pintu FL/FR/RL/RR\nB = sabuk\nT = ban kempis\nO = campuran AFR"
+            "Tombol uji (mode demo):\n1-4 = pintu FL/FR/RL/RR\nB = sabuk\nT = ban kempis\nO = campuran AFR\nQ / E = sein kiri / kanan\nH = hazard"
             if self.demo else "")
 
     def update_telemetry(self):
