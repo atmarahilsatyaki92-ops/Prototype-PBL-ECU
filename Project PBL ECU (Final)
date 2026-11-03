@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFrame, QSizePolicy,
     QStackedWidget, QPushButton, QLineEdit, QGridLayout, QMessageBox, QProgressBar
 )
-from PyQt5.QtCore import QTimer, Qt, QRectF, QPointF, QRect
+from PyQt5.QtCore import QTimer, Qt, QRectF, QPointF, QRect, QSize
 from PyQt5.QtGui import (
     QFont, QFontMetrics, QPainter, QColor, QPen, QPixmap, QPainterPath,
     QLinearGradient, QRadialGradient, QBrush, QImage,
@@ -587,6 +587,23 @@ def draw_icon(p, name, rect, color, lw=1.8):
         ln.lineTo(19, 7.5)
         p.drawPath(ln)
 
+    elif name == "fingerprint":
+        for r in (3.2, 6.2, 9.2):
+            p.drawArc(QRectF(12 - r, 12.5 - r, 2 * r, 2 * r), -20 * 16, 220 * 16)
+        p.drawLine(QPointF(12, 12.5), QPointF(12, 18.5))
+        p.drawLine(QPointF(8.5, 14), QPointF(8.5, 19.5))
+
+    elif name == "card":
+        p.drawRoundedRect(QRectF(3, 5.5, 18, 13), 2.5, 2.5)
+        p.drawLine(QPointF(3, 10), QPointF(21, 10))
+        p.drawRoundedRect(QRectF(6, 13, 4.5, 3), 0.8, 0.8)
+
+    elif name == "key":
+        p.drawEllipse(QPointF(8, 12), 4, 4)
+        p.drawLine(QPointF(12, 12), QPointF(21, 12))
+        p.drawLine(QPointF(18, 12), QPointF(18, 15.5))
+        p.drawLine(QPointF(21, 12), QPointF(21, 14.5))
+
     p.restore()
 
 
@@ -614,7 +631,7 @@ def make_card_head(icon, title, icon_color="#94a3b8", with_value=False):
     row.setSpacing(S(8))
     row.addWidget(IconWidget(icon, 16, icon_color))
     lbl = QLabel(title.upper())
-    lbl.setStyleSheet(label_qss(GRAY, 11, True))
+    lbl.setStyleSheet(label_qss(GRAY, 12, True))
     row.addWidget(lbl)
     row.addStretch()
     val = None
@@ -737,57 +754,86 @@ class ModeButton(QPushButton):
         p.drawText(QRectF(S(25), 0, w - S(28), h), Qt.AlignCenter, self.text())
 
 
-class StatusPill(QWidget):
-    """Pill status ringkas: netral saat normal, berwarna hanya saat ada masalah."""
+class StatusBar(QWidget):
+    """Status bar bersegmen (satu baris): netral saat normal, hanya segmen bermasalah yang berwarna."""
 
-    def __init__(self, icon, parent=None):
+    def __init__(self, icons, parent=None):
         super().__init__(parent)
-        self.icon_name = icon
-        self.title = ""
-        self.sub = ""
-        self.scheme = NEUTRAL_SCHEME
-        self.icon_color = GREEN
-        self._key = None
-        self.setFixedHeight(S(44))
+        self.slots = [{"icon": ic, "title": "", "sub": "", "scheme": NEUTRAL_SCHEME,
+                       "icon_color": GREEN, "key": None} for ic in icons]
+        self.setFixedHeight(S(40))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-    def set_state(self, title, sub, scheme, icon_color=None):
+    def set_slot(self, idx, title, sub, scheme, icon_color=None):
+        slot = self.slots[idx]
         key = (title, sub, scheme, icon_color)
-        if key == self._key:
+        if slot["key"] == key:
             return
-        self._key = key
-        self.title, self.sub, self.scheme = title, sub, scheme
-        self.icon_color = icon_color or scheme[1]
+        slot.update(key=key, title=title, sub=sub, scheme=scheme, icon_color=icon_color or scheme[1])
         self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        bg, fg, border = self.scheme
         w, h = float(self.width()), float(self.height())
+        n = len(self.slots)
+        seg = w / n
 
-        p.setPen(QPen(QColor(border), 1.2))
-        p.setBrush(QColor(bg))
-        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), h / 2, h / 2)
+        outline = QPainterPath()
+        outline.addRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), h / 2, h / 2)
 
+        # latar + segmen bermasalah diberi warna
+        p.save()
+        p.setClipPath(outline)
+        p.fillRect(QRectF(0, 0, w, h), QColor(NEUTRAL_SCHEME[0]))
+        for i, sl in enumerate(self.slots):
+            if sl["scheme"] != NEUTRAL_SCHEME:
+                p.fillRect(QRectF(i * seg, 0, seg, h), QColor(sl["scheme"][0]))
+        p.restore()
+
+        p.setPen(QPen(QColor("#1e293b"), 1.2))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(outline)
+
+        # pembatas antar segmen (disembunyikan di sebelah segmen berwarna)
+        for i in range(1, n):
+            if self.slots[i - 1]["scheme"] == NEUTRAL_SCHEME and self.slots[i]["scheme"] == NEUTRAL_SCHEME:
+                p.setPen(QPen(QColor("#1e293b"), 1))
+                p.drawLine(QPointF(i * seg, h * 0.25), QPointF(i * seg, h * 0.75))
+
+        # isi tiap segmen: ikon + judul (+ keterangan di sampingnya bila muat)
         f_t, f_s = font(12, True), font(11, False)
-        tw = text_width(f_t, self.title)
-        if self.sub:
-            tw = max(tw, text_width(f_s, self.sub))
-        icon, gap = S(20), S(10)
-        x0 = (w - (icon + gap + tw)) / 2
-        draw_icon(p, self.icon_name, QRectF(x0, (h - icon) / 2, icon, icon), self.icon_color, 1.7)
-
-        tx = x0 + icon + gap
-        p.setPen(QColor(fg))
-        p.setFont(f_t)
-        if self.sub:
-            p.drawText(QRectF(tx, S(5), tw + S(8), S(18)), Qt.AlignLeft | Qt.AlignVCenter, self.title)
-            p.setFont(f_s)
-            p.drawText(QRectF(tx, S(23), tw + S(8), S(16)), Qt.AlignLeft | Qt.AlignVCenter, self.sub)
-        else:
-            p.drawText(QRectF(tx, 0, tw + S(8), h), Qt.AlignLeft | Qt.AlignVCenter, self.title)
+        icon, gap = S(18), S(8)
+        for i, sl in enumerate(self.slots):
+            bg, fg, _ = sl["scheme"]
+            avail = seg - S(28) - icon - gap
+            title, sub = sl["title"], sl["sub"]
+            tw = text_width(f_t, title)
+            if tw > avail:
+                title = QFontMetrics(f_t).elidedText(title, Qt.ElideRight, int(avail))
+                tw, sub = text_width(f_t, title), ""
+            sub_w = 0
+            if sub:
+                room = avail - tw - S(14)
+                if room > S(40):
+                    sub = QFontMetrics(f_s).elidedText(sub, Qt.ElideRight, int(room))
+                    sub_w = text_width(f_s, sub)
+                else:
+                    sub = ""
+            group_w = icon + gap + tw + ((S(14) + sub_w) if sub else 0)
+            x = i * seg + (seg - group_w) / 2
+            draw_icon(p, sl["icon"], QRectF(x, (h - icon) / 2, icon, icon), sl["icon_color"], 1.7)
+            tx = x + icon + gap
+            p.setPen(QColor(fg))
+            p.setFont(f_t)
+            p.drawText(QRectF(tx, 0, tw + 4, h), Qt.AlignLeft | Qt.AlignVCenter, title)
+            if sub:
+                c = QColor(fg)
+                c.setAlpha(190)
+                p.setPen(c)
+                p.setFont(f_s)
+                p.drawText(QRectF(tx + tw + S(14), 0, sub_w + 4, h), Qt.AlignLeft | Qt.AlignVCenter, sub)
 
 
 class ControlDock(QWidget):
@@ -981,15 +1027,32 @@ class Simulator:
 class ArcMeter(QWidget):
     def __init__(self, val_unit="A", max_val=120, color=CYAN, parent=None):
         super().__init__(parent)
-        self.value = 0.0
+        self.value = 0.0            # nilai yang digambar (dianimasikan)
+        self.target = 0.0           # nilai sebenarnya
         self.val_unit = val_unit
         self.max_val = max_val
         self.color = QColor(color)
-        self.setMinimumSize(S(120), S(80))
+        self.setMinimumSize(S(120), S(90))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._anim = QTimer(self)
+        self._anim.setInterval(16)
+        self._anim.timeout.connect(self._step)
+
+    def sizeHint(self):
+        return QSize(S(190), S(135))
 
     def set_value(self, v):
-        self.value = max(0.0, min(float(self.max_val), v))
+        self.target = max(0.0, min(float(self.max_val), v))
+        if not self._anim.isActive() and abs(self.target - self.value) > 0.02:
+            self._anim.start()
+
+    def _step(self):
+        diff = self.target - self.value
+        if abs(diff) < max(0.02, self.max_val * 0.0005):
+            self.value = self.target
+            self._anim.stop()
+        else:
+            self.value += diff * 0.22
         self.update()
 
     def paintEvent(self, event):
@@ -999,11 +1062,11 @@ class ArcMeter(QWidget):
 
         w, h = self.width(), self.height()
         cx = w / 2
-        r = max(S(30), min(w / 2 - S(20), h - S(44)))
+        r = max(S(30), min(w / 2 - S(16), h - S(40)))
         pw = max(S(7), r * 0.09)
 
         # blok gauge (busur + label batas) dipusatkan secara vertikal
-        block_h = r + pw + S(22)
+        block_h = r + pw + S(24)
         y_top = max(0.0, (h - block_h) / 2)
         cy = y_top + pw / 2 + r
         rect = QRectF(cx - r, cy - r, 2 * r, 2 * r)
@@ -1024,14 +1087,15 @@ class ArcMeter(QWidget):
             p.setBrush(QColor("#ffffff"))
             p.drawEllipse(QPointF(dot_x, dot_y), pw * 0.6, pw * 0.6)
 
+        # nilai ditampilkan dari data sebenarnya (bukan nilai animasi)
         p.setPen(QColor("#ffffff"))
-        p.setFont(rfont(r * 0.27, True))
-        p.drawText(QRectF(0, cy - r * 0.62, w, r * 0.40), Qt.AlignCenter, f"{self.value:.1f} {self.val_unit}")
+        p.setFont(rfont(r * 0.30, True))
+        p.drawText(QRectF(0, cy - r * 0.64, w, r * 0.42), Qt.AlignCenter, f"{self.target:.1f} {self.val_unit}")
 
         p.setPen(QColor(GRAY))
-        p.setFont(font(10))
-        p.drawText(QRectF(cx - r - pw, cy + S(6), S(50), S(14)), Qt.AlignLeft, "0" + self.val_unit)
-        p.drawText(QRectF(cx + r - S(50) + pw, cy + S(6), S(50), S(14)), Qt.AlignRight,
+        p.setFont(font(11))
+        p.drawText(QRectF(cx - r - pw, cy + S(6), S(54), S(16)), Qt.AlignLeft, "0" + self.val_unit)
+        p.drawText(QRectF(cx + r - S(54) + pw, cy + S(6), S(54), S(16)), Qt.AlignRight,
                    f"{self.max_val}" + self.val_unit)
 
 
@@ -1041,7 +1105,8 @@ class SpeedGauge(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.value = 61.0
+        self.value = 0.0            # nilai yang digambar (dianimasikan)
+        self.target = 0.0           # nilai sebenarnya
         # lampu sein & hazard (kedipan dibuat di sini, ~1,5 Hz)
         self.sig_left = False
         self.sig_right = False
@@ -1051,11 +1116,24 @@ class SpeedGauge(QWidget):
         self._blink_timer.setInterval(330)
         self._blink_timer.timeout.connect(self._on_blink)
         self._blink_timer.start()
+        self._anim = QTimer(self)
+        self._anim.setInterval(16)
+        self._anim.timeout.connect(self._step)
         self.setMinimumSize(S(180), S(180))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def set_value(self, v):
-        self.value = max(0.0, min(float(MAX_SPEED), v))
+        self.target = max(0.0, min(float(MAX_SPEED), v))
+        if not self._anim.isActive() and abs(self.target - self.value) > 0.05:
+            self._anim.start()
+
+    def _step(self):
+        diff = self.target - self.value
+        if abs(diff) < 0.05:
+            self.value = self.target
+            self._anim.stop()
+        else:
+            self.value += diff * 0.22
         self.update()
 
     def _on_blink(self):
@@ -1086,6 +1164,18 @@ class SpeedGauge(QWidget):
         base = [(-1.0, 0.0), (-0.15, -0.8), (-0.15, -0.35), (1.0, -0.35),
                 (1.0, 0.35), (-0.15, 0.35), (-0.15, 0.8)]      # panah menunjuk ke kiri
 
+        def glow(x, color):
+            g = QRadialGradient(QPointF(x, y), u * 2.6)
+            c1 = QColor(color)
+            c1.setAlpha(130)
+            c0 = QColor(color)
+            c0.setAlpha(0)
+            g.setColorAt(0.0, c1)
+            g.setColorAt(1.0, c0)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(g))
+            p.drawEllipse(QPointF(x, y), u * 2.6, u * 2.6)
+
         def arrow(x, m, lit):
             path = QPainterPath()
             for i, (px_, py_) in enumerate(base):
@@ -1096,9 +1186,8 @@ class SpeedGauge(QWidget):
                     path.lineTo(pt)
             path.closeSubpath()
             if lit:
+                glow(x, GREEN)
                 p.setPen(Qt.NoPen)
-                p.setBrush(QColor(34, 197, 94, 55))
-                p.drawEllipse(QPointF(x, y), u * 1.6, u * 1.6)
                 p.setBrush(QColor(GREEN))
             else:
                 p.setPen(QPen(QColor("#2a3b5c"), 1))
@@ -1114,9 +1203,8 @@ class SpeedGauge(QWidget):
         tri.lineTo(cx - u * 1.1, y + u * 0.8)
         tri.closeSubpath()
         if lit_haz:
+            glow(cx, RED)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(239, 68, 68, 55))
-            p.drawEllipse(QPointF(cx, y), u * 1.6, u * 1.6)
             p.setBrush(QColor(RED))
         else:
             p.setPen(QPen(QColor("#2a3b5c"), 1))
@@ -1166,19 +1254,17 @@ class SpeedGauge(QWidget):
             p.drawLine(self._pt(cx, cy, r_in, v), self._pt(cx, cy, r_in - ln, v))
             if major:
                 lp = self._pt(cx, cy, r_in - s * 0.09, v)
-                p.setFont(rfont(s * 0.040, True))
+                p.setFont(rfont(s * 0.042, True))
                 p.setPen(QColor("#cbd5e1"))
-                p.drawText(QRectF(lp.x() - 20, lp.y() - 10, 40, 20), Qt.AlignCenter, str(v))
+                p.drawText(QRectF(lp.x() - 22, lp.y() - 11, 44, 22), Qt.AlignCenter, str(v))
 
-        p.setPen(QColor("#94a3b8"))
-        p.setFont(rfont(s * 0.038, True))
-        p.drawText(QRectF(0, cy - s * 0.25, w, s * 0.06), Qt.AlignCenter, "KECEPATAN")
+        # angka kecepatan memakai data sebenarnya (busur dianimasikan, angka tidak tertinggal)
         p.setPen(QColor("#ffffff"))
-        p.setFont(rfont(s * 0.28, True))
-        p.drawText(QRectF(0, cy - s * 0.18, w, s * 0.30), Qt.AlignCenter, str(int(self.value)))
+        p.setFont(rfont(s * 0.30, True))
+        p.drawText(QRectF(0, cy - s * 0.22, w, s * 0.32), Qt.AlignCenter, str(int(round(self.target))))
         p.setPen(QColor(GRAY))
-        p.setFont(rfont(s * 0.06, True))
-        p.drawText(QRectF(0, cy + s * 0.14, w, s * 0.08), Qt.AlignCenter, "km/h")
+        p.setFont(rfont(s * 0.062, True))
+        p.drawText(QRectF(0, cy + s * 0.11, w, s * 0.08), Qt.AlignCenter, "km/h")
 
         self._draw_signals(p, cx, cy, s)
 
@@ -1288,7 +1374,7 @@ class ConsumptionCard(QFrame):
         row, _ = make_card_head("chart", "Konsumsi Energi", CYAN)
         left.addLayout(row)
         self.lbl_avg = QLabel("Rata-rata 20 Wh")
-        self.lbl_avg.setStyleSheet(label_qss("#64748b", 11, False, f"margin-left: {S(24)}px;"))
+        self.lbl_avg.setStyleSheet(label_qss("#64748b", 12, False, f"margin-left: {S(24)}px;"))
         left.addWidget(self.lbl_avg)
         self.lbl_cur = QLabel("20 Wh")
         self.lbl_cur.setStyleSheet(label_qss(CYAN, 22, True))
@@ -1435,7 +1521,7 @@ class CarCenterViewDetailed(QWidget):
         ratio = max(0.0, min(1.0, ratio))
         cx = x + bw / 2
 
-        draw_icon(p, icon, QRectF(cx - 10 * k, y - 36 * k, 20 * k, 20 * k), "#cbd5e1")
+        draw_icon(p, icon, QRectF(cx - 11 * k, y - 38 * k, 22 * k, 22 * k), "#cbd5e1")
 
         p.setPen(Qt.NoPen)
         p.setBrush(QColor("#14213d"))
@@ -1456,35 +1542,39 @@ class CarCenterViewDetailed(QWidget):
             p.drawRoundedRect(QRectF(x, y + bh - fh, bw, fh), bw / 2, bw / 2)
 
         p.setPen(QColor("#ffffff"))
-        p.setFont(font(14, True))
-        p.drawText(QRectF(cx - 45 * k, y + bh + 8 * k, 90 * k, 20 * k), Qt.AlignCenter, value)
+        p.setFont(font(15, True))
+        p.drawText(QRectF(cx - 50 * k, y + bh + 8 * k, 100 * k, 22 * k), Qt.AlignCenter, value)
         p.setPen(QColor(GRAY))
-        p.setFont(font(10, True))
-        p.drawText(QRectF(cx - 45 * k, y + bh + 28 * k, 90 * k, 14 * k), Qt.AlignCenter, label)
+        p.setFont(font(11, True))
+        p.drawText(QRectF(cx - 50 * k, y + bh + 30 * k, 100 * k, 16 * k), Qt.AlignCenter, label)
 
     def _chip(self, p, rect, title, value, color, ratio, k):
-        """Kartu metrik tab Engine: judul, nilai, bar rasio tipis."""
+        """Kartu metrik tab Engine: isi dipusatkan vertikal, ukuran angka mengikuti tinggi kartu."""
         p.setPen(QPen(QColor("#1e293b"), 1))
         p.setBrush(QColor("#0f172a"))
         p.drawRoundedRect(rect, 10 * k, 10 * k)
 
-        x, y, w = rect.x() + 14 * k, rect.y(), rect.width() - 28 * k
-        p.setPen(QColor(GRAY))
-        p.setFont(font(11, True))
-        p.drawText(QRectF(x, y + 10 * k, w, 16 * k), Qt.AlignLeft | Qt.AlignVCenter, title)
-        p.setPen(QColor("#ffffff"))
-        p.setFont(font(24, True))
-        p.drawText(QRectF(x, y + 28 * k, w, 34 * k), Qt.AlignLeft | Qt.AlignVCenter, value)
+        x, w = rect.x() + 16 * k, rect.width() - 32 * k
+        vs = max(24 * k, min(40 * k, rect.height() * 0.30))
+        title_h, val_h, bar_h = 16 * k, vs * 1.25, 6 * k
+        block = title_h + 4 * k + val_h + 10 * k + bar_h
+        y = rect.y() + (rect.height() - block) / 2
 
-        by = rect.bottom() - 16 * k
-        bh = 5 * k
+        p.setPen(QColor(GRAY))
+        p.setFont(font(12, True))
+        p.drawText(QRectF(x, y, w, title_h), Qt.AlignLeft | Qt.AlignVCenter, title)
+        p.setPen(QColor("#ffffff"))
+        p.setFont(rfont(vs, True))
+        p.drawText(QRectF(x, y + title_h + 4 * k, w, val_h), Qt.AlignLeft | Qt.AlignVCenter, value)
+
+        by = y + title_h + 4 * k + val_h + 10 * k
         p.setPen(Qt.NoPen)
         p.setBrush(QColor("#1e293b"))
-        p.drawRoundedRect(QRectF(x, by, w, bh), bh / 2, bh / 2)
+        p.drawRoundedRect(QRectF(x, by, w, bar_h), bar_h / 2, bar_h / 2)
         ratio = max(0.0, min(1.0, ratio))
         if ratio > 0.01:
             p.setBrush(QColor(color))
-            p.drawRoundedRect(QRectF(x, by, w * ratio, bh), bh / 2, bh / 2)
+            p.drawRoundedRect(QRectF(x, by, w * ratio, bar_h), bar_h / 2, bar_h / 2)
 
     # ---------------- paint ----------------
     def paintEvent(self, event):
@@ -1554,13 +1644,12 @@ class CarCenterViewDetailed(QWidget):
         self._vbar(p, x_r, bar_y, bar_w, bar_h, min(60.0, self.temp) / 60.0, tmp_col,
                    "thermo", f"{int(self.temp)}°C", "SUHU BATT", k)
 
-    # ---------- TAB: ENGINE (2x2 + sensor oksigen + beban) ----------
+    # ---------- TAB: ENGINE (mengisi seluruh panel) ----------
     def _paint_engine(self, p, w, h, k):
         margin = 12 * k
-        gap = 10 * k
-        title_h = 28 * k
-        o2_h = 92 * k
-        bar_block = 44 * k
+        gap = 12 * k
+        title_h = 30 * k
+        bar_block = 50 * k
 
         rpm = int(self.speed * 42.5)
         motor_temp = min(95, int(35 + self.speed * 0.4))
@@ -1574,14 +1663,16 @@ class CarCenterViewDetailed(QWidget):
             ("EFISIENSI", "94.2%", GREEN, 0.942),
         ]
 
-        avail = h - margin * 2 - title_h - o2_h - bar_block - gap * 3
-        card_h = max(84 * k, min(104 * k, avail / 2))
+        # tinggi tersedia dibagi: dua baris kartu (30% masing-masing) + kartu oksigen (sisa)
+        avail = h - margin * 2 - title_h - bar_block - gap * 3
+        card_h = max(84 * k, min(150 * k, avail * 0.30))
+        o2_h = max(96 * k, min(150 * k, avail - 2 * card_h))
         used = title_h + 2 * card_h + o2_h + bar_block + gap * 3
         y0 = margin + max(0.0, (h - margin * 2 - used) / 2)
 
         p.setPen(QColor("#ffffff"))
-        p.setFont(font(13, True))
-        p.drawText(QRectF(0, y0, w, 22 * k), Qt.AlignCenter, "STATUS PENGGERAK")
+        p.setFont(font(14, True))
+        p.drawText(QRectF(0, y0, w, 24 * k), Qt.AlignCenter, "STATUS PENGGERAK")
 
         top = y0 + title_h
         card_w = (w - margin * 2 - gap) / 2
@@ -1590,22 +1681,20 @@ class CarCenterViewDetailed(QWidget):
             ry = top + (idx // 2) * (card_h + gap)
             self._chip(p, QRectF(rx, ry, card_w, card_h), title, val, col, ratio, k)
 
-        # sensor oksigen (AFR) selebar panel
         o2_y = top + 2 * card_h + gap + gap
         self._o2_card(p, QRectF(margin, o2_y, w - margin * 2, o2_h), k)
 
-        # beban motor
         label_y = o2_y + o2_h + gap
-        by = label_y + 22 * k
+        by = label_y + 24 * k
 
         p.setPen(QColor(GRAY))
-        p.setFont(font(11, True))
-        p.drawText(QRectF(margin, label_y, w / 2, 18 * k), Qt.AlignLeft | Qt.AlignVCenter, "BEBAN MOTOR")
+        p.setFont(font(12, True))
+        p.drawText(QRectF(margin, label_y, w / 2, 20 * k), Qt.AlignLeft | Qt.AlignVCenter, "BEBAN MOTOR")
         p.setPen(QColor("#ffffff"))
-        p.drawText(QRectF(w / 2, label_y, w / 2 - margin, 18 * k), Qt.AlignRight | Qt.AlignVCenter,
+        p.drawText(QRectF(w / 2, label_y, w / 2 - margin, 20 * k), Qt.AlignRight | Qt.AlignVCenter,
                    f"{load * 100:.0f}%")
 
-        bar_h = 10 * k
+        bar_h = 12 * k
         p.setPen(Qt.NoPen)
         p.setBrush(QColor("#1e293b"))
         p.drawRoundedRect(QRectF(margin, by, w - margin * 2, bar_h), bar_h / 2, bar_h / 2)
@@ -1623,7 +1712,8 @@ class CarCenterViewDetailed(QWidget):
         p.setBrush(QColor("#0f172a"))
         p.drawRoundedRect(rect, 10 * k, 10 * k)
 
-        x, y, w = rect.x() + 14 * k, rect.y(), rect.width() - 28 * k
+        x, y, w = rect.x() + 16 * k, rect.y(), rect.width() - 32 * k
+        hh = rect.height()
         afr = self.afr
         if afr is None:
             status, col, val_txt, lam_txt = "MESIN MATI", MUTED, "—", ""
@@ -1632,27 +1722,25 @@ class CarCenterViewDetailed(QWidget):
             val_txt = f"{afr:.1f}"
             lam_txt = f"λ {afr / STOICH_AFR:.2f}"
 
-        # judul + status
         p.setPen(QColor(GRAY))
-        p.setFont(font(11, True))
-        p.drawText(QRectF(x, y + 9 * k, w * 0.6, 16 * k), Qt.AlignLeft | Qt.AlignVCenter, "SENSOR OKSIGEN (AFR)")
+        p.setFont(font(12, True))
+        p.drawText(QRectF(x, y + hh * 0.08, w * 0.6, 18 * k), Qt.AlignLeft | Qt.AlignVCenter, "SENSOR OKSIGEN (AFR)")
         p.setPen(QColor(col))
-        p.drawText(QRectF(x + w * 0.4, y + 9 * k, w * 0.6, 16 * k), Qt.AlignRight | Qt.AlignVCenter, status)
+        p.drawText(QRectF(x + w * 0.4, y + hh * 0.08, w * 0.6, 18 * k), Qt.AlignRight | Qt.AlignVCenter, status)
 
-        # nilai besar "14.7 : 1" dan lambda
-        f_val = font(26, True)
+        vs = max(24 * k, min(38 * k, hh * 0.30))
+        f_val = rfont(vs, True)
         p.setPen(QColor("#ffffff"))
         p.setFont(f_val)
-        p.drawText(QRectF(x, y + 25 * k, w * 0.5, 34 * k), Qt.AlignLeft | Qt.AlignVCenter, val_txt)
+        p.drawText(QRectF(x, y + hh * 0.20, w * 0.5, hh * 0.36), Qt.AlignLeft | Qt.AlignVCenter, val_txt)
         if afr is not None:
             vw = text_width(f_val, val_txt)
             p.setPen(QColor(GRAY))
-            p.setFont(font(13, True))
-            p.drawText(QRectF(x + vw + 6 * k, y + 25 * k, 50 * k, 34 * k), Qt.AlignLeft | Qt.AlignVCenter, ": 1")
-            p.drawText(QRectF(x + w * 0.5, y + 25 * k, w * 0.5, 34 * k), Qt.AlignRight | Qt.AlignVCenter, lam_txt)
+            p.setFont(font(14, True))
+            p.drawText(QRectF(x + vw + 6 * k, y + hh * 0.20, 60 * k, hh * 0.36), Qt.AlignLeft | Qt.AlignVCenter, ": 1")
+            p.drawText(QRectF(x + w * 0.5, y + hh * 0.20, w * 0.5, hh * 0.36), Qt.AlignRight | Qt.AlignVCenter, lam_txt)
 
-        # skala zona campuran
-        bar_y, bar_h = y + 64 * k, 8 * k
+        bar_y, bar_h = y + hh * 0.68, max(8 * k, hh * 0.08)
         span = AFR_SCALE_MAX - AFR_SCALE_MIN
 
         def fx(v):
@@ -1670,40 +1758,41 @@ class CarCenterViewDetailed(QWidget):
             p.drawRect(QRectF(fx(lo), bar_y, fx(hi) - fx(lo), bar_h))
         p.restore()
 
-        # tanda campuran ideal (14.7) dan penanda nilai saat ini
         p.setPen(QPen(QColor("#cbd5e1"), 1.2))
         p.drawLine(QPointF(fx(STOICH_AFR), bar_y - 3 * k), QPointF(fx(STOICH_AFR), bar_y + bar_h + 3 * k))
         if afr is not None:
             p.setPen(QPen(QColor(col), 2 * k))
             p.setBrush(QColor("#ffffff"))
-            p.drawEllipse(QPointF(fx(afr), bar_y + bar_h / 2), 5.5 * k, 5.5 * k)
+            p.drawEllipse(QPointF(fx(afr), bar_y + bar_h / 2), max(5.5 * k, bar_h * 0.75), max(5.5 * k, bar_h * 0.75))
 
-        # label skala
         p.setPen(QColor("#64748b"))
-        p.setFont(font(9, True))
-        ly = bar_y + bar_h + 5 * k
-        p.drawText(QRectF(x, ly, 60 * k, 12 * k), Qt.AlignLeft | Qt.AlignVCenter, "KAYA")
-        p.drawText(QRectF(fx(STOICH_AFR) - 25 * k, ly, 50 * k, 12 * k), Qt.AlignCenter, "14.7")
-        p.drawText(QRectF(x + w - 60 * k, ly, 60 * k, 12 * k), Qt.AlignRight | Qt.AlignVCenter, "MISKIN")
+        p.setFont(font(11, True))
+        ly = bar_y + bar_h + 4 * k
+        p.drawText(QRectF(x, ly, 60 * k, 14 * k), Qt.AlignLeft | Qt.AlignVCenter, "KAYA")
+        p.drawText(QRectF(fx(STOICH_AFR) - 25 * k, ly, 50 * k, 14 * k), Qt.AlignCenter, "14.7")
+        p.drawText(QRectF(x + w - 70 * k, ly, 70 * k, 14 * k), Qt.AlignRight | Qt.AlignVCenter, "MISKIN")
 
-    # ---------- TAB: WHEELS ----------
+    # ---------- TAB: WHEELS (diagram mengisi panel) ----------
     def _paint_wheels(self, p, w, h, k):
         margin = 12 * k
         cx = w / 2
         p.setPen(QColor("#ffffff"))
-        p.setFont(font(13, True))
-        p.drawText(QRectF(0, margin, w, 22 * k), Qt.AlignCenter, "TEKANAN BAN (TPMS)")
+        p.setFont(font(14, True))
+        p.drawText(QRectF(0, margin, w, 24 * k), Qt.AlignCenter, "TEKANAN BAN (TPMS)")
 
         top = margin + 34 * k
-        status_h = 30 * k
+        status_h = 34 * k
         avail_h = h - top - status_h - margin
 
-        box_h = min(avail_h, 340 * k)
+        # tinggi chassis dibatasi tinggi panel dan lebar panel (kotak ban menonjol di kiri-kanan)
+        box_h = min(avail_h, 620 * k, (w - margin * 2) / 0.84)
         box_w = box_h * 0.62
+        bw = box_h * 0.165
+        bh = bw * 1.12
         bx = cx - box_w / 2
         by = top + (avail_h - box_h) / 2
 
-        self._glow(p, cx, by + box_h / 2, min(w * 0.40, avail_h * 0.50), 40)
+        self._glow(p, cx, by + box_h / 2, min(w * 0.45, avail_h * 0.50), 40)
 
         p.setPen(QPen(QColor("#334155"), 2, Qt.DashLine))
         p.setBrush(Qt.NoBrush)
@@ -1715,11 +1804,10 @@ class CarCenterViewDetailed(QWidget):
             p.drawPixmap(int(cx - pix.width() / 2), int(by + (box_h - pix.height()) / 2), pix)
             p.setOpacity(1.0)
 
-        bw, bh = 56 * k, 62 * k
         left_x = bx - bw * 0.62
         right_x = bx + box_w - bw * 0.38
-        top_y = by + box_h * 0.06
-        bot_y = by + box_h * 0.94 - bh
+        top_y = by + box_h * 0.05
+        bot_y = by + box_h * 0.95 - bh
         wheels = [
             (left_x, top_y, "FL", self.tpms[0]),
             (right_x, top_y, "FR", self.tpms[1]),
@@ -1741,17 +1829,17 @@ class CarCenterViewDetailed(QWidget):
             p.drawRoundedRect(QRectF(wx, wy, bw, bh), 10 * k, 10 * k)
 
             p.setPen(QColor("#94a3b8"))
-            p.setFont(font(11, True))
-            p.drawText(QRectF(wx, wy + 5 * k, bw, 14 * k), Qt.AlignCenter, label)
+            p.setFont(rfont(max(11 * k, bw * 0.20), True))
+            p.drawText(QRectF(wx, wy + bh * 0.07, bw, bh * 0.22), Qt.AlignCenter, label)
             p.setPen(QColor(col))
-            p.setFont(font(18, True))
-            p.drawText(QRectF(wx, wy + 21 * k, bw, 24 * k), Qt.AlignCenter, str(psi))
+            p.setFont(rfont(max(18 * k, bw * 0.36), True))
+            p.drawText(QRectF(wx, wy + bh * 0.30, bw, bh * 0.40), Qt.AlignCenter, str(psi))
             p.setPen(QColor(GRAY))
-            p.setFont(font(9, True))
-            p.drawText(QRectF(wx, wy + 45 * k, bw, 12 * k), Qt.AlignCenter, "PSI")
+            p.setFont(rfont(max(10 * k, bw * 0.16), True))
+            p.drawText(QRectF(wx, wy + bh * 0.72, bw, bh * 0.20), Qt.AlignCenter, "PSI")
 
         p.setPen(QColor(GREEN if all_ok else AMBER))
-        p.setFont(font(11, True))
+        p.setFont(font(12, True))
         msg = ("Semua roda dalam tekanan ideal (30-40 PSI)" if all_ok
                else "Periksa ban yang berwarna kuning / merah")
         p.drawText(QRectF(0, h - margin - status_h, w, status_h), Qt.AlignCenter, msg)
@@ -1761,7 +1849,7 @@ class CarCenterViewDetailed(QWidget):
 # Kartu Energi gabungan (SOH + Estimasi Jarak + Bahan Bakar)
 # ---------------------------------------------------------
 class EnergyRow(QWidget):
-    """Satu baris metrik: ikon + nama + nilai besar, bar tipis, sub-teks."""
+    """Satu baris metrik: ikon + nama + angka besar, bar tebal, sub-teks. Isi dipusatkan vertikal."""
 
     def __init__(self, icon, title, unit, max_value):
         super().__init__()
@@ -1769,16 +1857,17 @@ class EnergyRow(QWidget):
         self.max_value = float(max_value)
         self._key = None
         self._bar_color = None
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(S(4))
+        lay.setSpacing(S(6))
 
         top = QHBoxLayout()
         top.setSpacing(S(8))
-        top.addWidget(IconWidget(icon, 16, GRAY))
+        top.addWidget(IconWidget(icon, 18, GRAY))
         lbl_t = QLabel(title.upper())
-        lbl_t.setStyleSheet(label_qss(GRAY, 11, True))
+        lbl_t.setStyleSheet(label_qss(GRAY, 12, True))
         top.addWidget(lbl_t)
         top.addStretch()
         self.lbl_val = QLabel()
@@ -1786,22 +1875,24 @@ class EnergyRow(QWidget):
         top.addWidget(self.lbl_val)
 
         self.pbar = QProgressBar()
-        self.pbar.setFixedHeight(S(6))
+        self.pbar.setFixedHeight(S(8))
         self.pbar.setRange(0, 100)
         self.pbar.setTextVisible(False)
 
         sub = QHBoxLayout()
         self.lbl_sub_l = QLabel()
-        self.lbl_sub_l.setStyleSheet(label_qss("#64748b", 11))
+        self.lbl_sub_l.setStyleSheet(label_qss("#64748b", 12))
         self.lbl_sub_r = QLabel()
-        self.lbl_sub_r.setStyleSheet(label_qss("#64748b", 11))
+        self.lbl_sub_r.setStyleSheet(label_qss("#64748b", 12))
         sub.addWidget(self.lbl_sub_l)
         sub.addStretch()
         sub.addWidget(self.lbl_sub_r)
 
+        lay.addStretch(1)
         lay.addLayout(top)
         lay.addWidget(self.pbar)
         lay.addLayout(sub)
+        lay.addStretch(1)
 
     def update_data(self, val, sub_l, sub_r, color):
         key = (val, sub_l, sub_r, color)
@@ -1810,14 +1901,14 @@ class EnergyRow(QWidget):
         self._key = key
         sep = "" if self.unit == "%" else " "
         self.lbl_val.setText(
-            f'<span style="font-size:{S(24)}px; font-weight:bold; color:#ffffff;">{val}</span>'
-            f'<span style="font-size:{S(13)}px; font-weight:bold; color:#94a3b8;">{sep}{self.unit}</span>')
+            f'<span style="font-size:{S(40)}px; font-weight:bold; color:#ffffff;">{val}</span>'
+            f'<span style="font-size:{S(16)}px; font-weight:bold; color:#94a3b8;">{sep}{self.unit}</span>')
         self.pbar.setValue(int(max(0.0, min(100.0, val / self.max_value * 100.0))))
         if color != self._bar_color:
             self._bar_color = color
             self.pbar.setStyleSheet(
-                f"QProgressBar {{ border: none; border-radius: {S(3)}px; background-color: #1e293b; }}"
-                f"QProgressBar::chunk {{ background-color: {color}; border-radius: {S(3)}px; }}")
+                f"QProgressBar {{ border: none; border-radius: {S(4)}px; background-color: #1e293b; }}"
+                f"QProgressBar::chunk {{ background-color: {color}; border-radius: {S(4)}px; }}")
         self.lbl_sub_l.setText(sub_l)
         self.lbl_sub_r.setText(sub_r)
 
@@ -1829,8 +1920,8 @@ class EnergyCard(QFrame):
         self.setStyleSheet(card_style())
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(S(16), S(12), S(16), S(14))
-        lay.setSpacing(S(8))
+        lay.setContentsMargins(S(16), S(12), S(16), S(12))
+        lay.setSpacing(S(4))
 
         head, _ = make_card_head("battery", "Energi", CYAN)
         self.row_soh = EnergyRow("battery", "Battery Health", "%", 100)
@@ -1838,11 +1929,11 @@ class EnergyCard(QFrame):
         self.row_fuel = EnergyRow("fuel", "Fuel Tank", "%", 100)
 
         lay.addLayout(head)
-        lay.addWidget(self.row_soh)
+        lay.addWidget(self.row_soh, 1)
         lay.addWidget(self._divider())
-        lay.addWidget(self.row_range)
+        lay.addWidget(self.row_range, 1)
         lay.addWidget(self._divider())
-        lay.addWidget(self.row_fuel)
+        lay.addWidget(self.row_fuel, 1)
 
     def _divider(self):
         d = QFrame()
@@ -1854,6 +1945,41 @@ class EnergyCard(QFrame):
 # ---------------------------------------------------------
 # HALAMAN 1: AUTENTIKASI
 # ---------------------------------------------------------
+class AuthTile(QPushButton):
+    """Tile login besar dengan ikon vektor (pengganti emoji)."""
+
+    def __init__(self, icon, title, subtitle, parent=None):
+        super().__init__(parent)
+        self.icon_name = icon
+        self.title = title
+        self.subtitle = subtitle
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setMinimumHeight(S(180))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        w, h = float(self.width()), float(self.height())
+        hover = self.underMouse()
+        p.setPen(QPen(QColor("#0284c7" if hover else "#22304f"), 2))
+        p.setBrush(QColor("#0c4a6e" if hover else "#152238"))
+        p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), S(14), S(14))
+
+        ic = S(56)
+        top = h * 0.5 - (ic + S(60)) / 2
+        draw_icon(p, self.icon_name, QRectF(w / 2 - ic / 2, top, ic, ic), "#38bdf8", 1.6)
+        p.setPen(QColor("#ffffff"))
+        p.setFont(font(15, True))
+        p.drawText(QRectF(0, top + ic + S(10), w, S(24)), Qt.AlignCenter, self.title)
+        p.setPen(QColor(GRAY))
+        p.setFont(font(12))
+        p.drawText(QRectF(0, top + ic + S(36), w, S(20)), Qt.AlignCenter, self.subtitle)
+
+
 class AuthPage(QWidget):
     def __init__(self, on_login_success):
         super().__init__()
@@ -1891,54 +2017,59 @@ class AuthPage(QWidget):
         hdr.addWidget(logo_r)
         card_layout.addLayout(hdr)
 
-        card_layout.addSpacing(S(30))
+        card_layout.addSpacing(S(24))
 
         grid = QGridLayout()
-        grid.setSpacing(S(20))
+        grid.setSpacing(S(16))
+        for c in range(3):
+            grid.setColumnStretch(c, 1)
 
-        btn_finger = QPushButton("👆\n\nPINDAI SIDIK JARI\n(Fingerprint Sensor)")
-        btn_finger.setFont(font(14, True))
-        btn_finger.setStyleSheet(f"""
-            QPushButton {{ background-color: #1e293b; color: #38bdf8; border: 2px solid #0284c7; border-radius: {S(12)}px; padding: {S(20)}px; }}
-            QPushButton:hover {{ background-color: #0369a1; color: white; }}
-        """)
-        btn_finger.clicked.connect(lambda: self.verify_access("Fingerprint Terverifikasi", "Pengemudi: Atmarahil Satyaki"))
+        tile_finger = AuthTile("fingerprint", "PINDAI SIDIK JARI", "Fingerprint Sensor")
+        tile_finger.clicked.connect(lambda: self.verify_access("Fingerprint Terverifikasi", "Pengemudi: Atmarahil Satyaki"))
 
-        btn_rfid = QPushButton("💳\n\nTEMPELKAN KARTU\n(RFID / NFC Tag)")
-        btn_rfid.setFont(font(14, True))
-        btn_rfid.setStyleSheet(f"""
-            QPushButton {{ background-color: #1e293b; color: #22c55e; border: 2px solid #16a34a; border-radius: {S(12)}px; padding: {S(20)}px; }}
-            QPushButton:hover {{ background-color: #15803d; color: white; }}
-        """)
-        btn_rfid.clicked.connect(lambda: self.verify_access("Kartu RFID Terverifikasi", "E-KTM Polibatam: 3112301001"))
+        tile_rfid = AuthTile("card", "TEMPELKAN KARTU", "RFID / NFC Tag")
+        tile_rfid.clicked.connect(lambda: self.verify_access("Kartu RFID Terverifikasi", "E-KTM Polibatam: 3112301001"))
 
         manual_box = QFrame()
-        manual_box.setStyleSheet(f"background-color: #1e293b; border-radius: {S(12)}px; padding: {S(15)}px;")
+        manual_box.setObjectName("manual")
+        manual_box.setStyleSheet(f"QFrame#manual {{ background-color: #152238; border: 2px solid #22304f; "
+                                 f"border-radius: {S(14)}px; }}")
         v_man = QVBoxLayout(manual_box)
-        lbl_man = QLabel("🔑 INPUT MANUAL (NIP / PIN)")
-        lbl_man.setFont(font(12, True))
-        lbl_man.setStyleSheet("color: #f59e0b;")
+        v_man.setContentsMargins(S(18), S(16), S(18), S(16))
+        v_man.setSpacing(S(10))
+
+        man_head = QHBoxLayout()
+        man_head.setSpacing(S(8))
+        man_head.addWidget(IconWidget("key", 22, CYAN))
+        lbl_man = QLabel("INPUT MANUAL (NIP / PIN)")
+        lbl_man.setStyleSheet(label_qss("#cbd5e1", 12, True))
+        man_head.addWidget(lbl_man)
+        man_head.addStretch()
 
         self.txt_pin = QLineEdit()
         self.txt_pin.setPlaceholderText("Masukkan PIN / NIM / NIP...")
         self.txt_pin.setEchoMode(QLineEdit.Password)
         self.txt_pin.setFont(font(14))
-        self.txt_pin.setStyleSheet(f"background-color: #0f1724; color: white; border: 1px solid #475569; border-radius: {S(8)}px; padding: {S(8)}px;")
+        self.txt_pin.setStyleSheet(f"background-color: #0f1724; color: white; border: 1px solid #475569; "
+                                   f"border-radius: {S(8)}px; padding: {S(8)}px;")
 
         btn_pin = QPushButton("VERIFIKASI PIN")
         btn_pin.setFont(font(12, True))
+        btn_pin.setCursor(Qt.PointingHandCursor)
         btn_pin.setStyleSheet(f"""
-            QPushButton {{ background-color: #d97706; color: white; border-radius: {S(8)}px; padding: {S(10)}px; }}
-            QPushButton:hover {{ background-color: #b45309; }}
+            QPushButton {{ background-color: #0284c7; color: white; border-radius: {S(8)}px; padding: {S(10)}px; }}
+            QPushButton:hover {{ background-color: #0369a1; }}
         """)
         btn_pin.clicked.connect(self.check_pin)
 
-        v_man.addWidget(lbl_man)
+        v_man.addLayout(man_head)
+        v_man.addStretch()
         v_man.addWidget(self.txt_pin)
         v_man.addWidget(btn_pin)
+        v_man.addStretch()
 
-        grid.addWidget(btn_finger, 0, 0)
-        grid.addWidget(btn_rfid, 0, 1)
+        grid.addWidget(tile_finger, 0, 0)
+        grid.addWidget(tile_rfid, 0, 1)
         grid.addWidget(manual_box, 0, 2)
 
         card_layout.addLayout(grid)
@@ -1997,8 +2128,8 @@ class DashboardPage(QWidget):
             return
         self._amb_key = t
         self.lbl_ambient.setText(
-            f'<div align="right"><span style="font-size:{S(15)}px; font-weight:bold; color:#ffffff;">{t}°C</span><br>'
-            f'<span style="font-size:{S(9)}px; font-weight:bold; color:#64748b;">SUHU LUAR</span></div>')
+            f'<div align="right"><span style="font-size:{S(19)}px; font-weight:bold; color:#ffffff;">{t}°C</span><br>'
+            f'<span style="font-size:{S(11)}px; font-weight:bold; color:#94a3b8;">SUHU LUAR</span></div>')
 
     def set_connection(self, text, color):
         """Indikator sumber data di header (DEMO / COM port / TERPUTUS)."""
@@ -2013,12 +2144,6 @@ class DashboardPage(QWidget):
             f"background: rgba({c.red()}, {c.green()}, {c.blue()}, 0.14); "
             f"padding: {S(5)}px {S(12)}px; border-radius: {S(7)}px;")
 
-    def _gauge_title(self, title, sub):
-        lbl = QLabel(f'<span style="font-size:{S(14)}px; font-weight:bold; color:#ffffff;">{title}</span><br>'
-                     f'<span style="font-size:{S(10)}px; color:#94a3b8;">{sub}</span>')
-        lbl.setTextFormat(Qt.RichText)
-        return lbl
-
     def _make_chip(self):
         lbl = QLabel("● NORMAL")
         lbl.setAlignment(Qt.AlignCenter)
@@ -2031,26 +2156,24 @@ class DashboardPage(QWidget):
         self._chip_state[id(lbl)] = (text, color)
         c = QColor(color)
         lbl.setText(f"● {text}")
-        lbl.setStyleSheet(f"color: {color}; font-size: {S(10)}px; font-weight: bold; "
+        lbl.setStyleSheet(f"color: {color}; font-size: {S(11)}px; font-weight: bold; "
                           f"background: rgba({c.red()}, {c.green()}, {c.blue()}, 0.15); "
                           f"padding: {S(3)}px {S(8)}px; border-radius: {S(4)}px;")
 
-    def _gauge_row(self, title, sub, meter):
-        """Baris gauge: judul + chip di kiri, busur di kanan."""
-        row = QHBoxLayout()
-        row.setSpacing(S(8))
+    def _gauge_cell(self, title, meter):
+        """Satu sel gauge: judul + chip status di atas, busur di bawah."""
+        cell = QVBoxLayout()
+        cell.setSpacing(S(2))
+        top = QHBoxLayout()
+        lbl = QLabel(title)
+        lbl.setStyleSheet(label_qss("#ffffff", 14, True))
         chip = self._make_chip()
-        left = QVBoxLayout()
-        left.setSpacing(S(4))
-        left.addWidget(self._gauge_title(title, sub))
-        left.addWidget(chip, 0, Qt.AlignLeft)
-        left.addStretch()
-        left_w = QWidget()
-        left_w.setLayout(left)
-        left_w.setFixedWidth(S(92))
-        row.addWidget(left_w)
-        row.addWidget(meter, 1)
-        return row, chip
+        top.addWidget(lbl)
+        top.addStretch()
+        top.addWidget(chip)
+        cell.addLayout(top)
+        cell.addWidget(meter, 1)
+        return cell, chip
 
     def init_ui(self):
         root = QVBoxLayout(self)
@@ -2070,7 +2193,7 @@ class DashboardPage(QWidget):
         lbl_title = QLabel(APP_TITLE)
         lbl_title.setFont(font(13, True))
         lbl_sub = QLabel(APP_SUBTITLE)
-        lbl_sub.setStyleSheet(label_qss(GRAY, 10))
+        lbl_sub.setStyleSheet(label_qss(GRAY, 11))
         v_title.addWidget(lbl_title)
         v_title.addWidget(lbl_sub)
 
@@ -2131,36 +2254,41 @@ class DashboardPage(QWidget):
         main_layout = QHBoxLayout()
         main_layout.setSpacing(S(10))
 
-        # --- KOLOM 1: Battery Parameters (gauge bertumpuk) + Energi ---
+        # --- KOLOM 1: Battery Parameters (dua gauge sejajar) + Energi (mengisi sisa tinggi) ---
         col1 = QVBoxLayout()
         col1.setSpacing(S(10))
 
         card_params = self.make_card()
+        card_params.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         cp_lay = QVBoxLayout(card_params)
         cp_lay.setContentsMargins(S(16), S(12), S(16), S(10))
-        cp_lay.setSpacing(S(4))
+        cp_lay.setSpacing(S(6))
 
         head, self.lbl_power = make_card_head("bolt", "Battery Parameters", CYAN, with_value=True)
         self.lbl_power.setText("0.00 kW")
 
         self.meter_current = ArcMeter("A", 120, CYAN)
-        row_i, self.chip_i = self._gauge_row("Arus", "Sensor arus", self.meter_current)
+        cell_i, self.chip_i = self._gauge_cell("Arus", self.meter_current)
         self.meter_voltage = ArcMeter("V", VOLT_MAX_SCALE, CYAN)
-        row_v, self.chip_v = self._gauge_row("Tegangan", "Sensor tegangan", self.meter_voltage)
+        cell_v, self.chip_v = self._gauge_cell("Tegangan", self.meter_voltage)
 
-        divider = QFrame()
-        divider.setFixedHeight(1)
-        divider.setStyleSheet("background-color: #16223a; border: none;")
+        vdiv = QFrame()
+        vdiv.setFixedWidth(1)
+        vdiv.setStyleSheet("background-color: #16223a; border: none;")
+
+        row_gauges = QHBoxLayout()
+        row_gauges.setSpacing(S(12))
+        row_gauges.addLayout(cell_i, 1)
+        row_gauges.addWidget(vdiv)
+        row_gauges.addLayout(cell_v, 1)
 
         cp_lay.addLayout(head)
-        cp_lay.addLayout(row_i, 1)
-        cp_lay.addWidget(divider)
-        cp_lay.addLayout(row_v, 1)
+        cp_lay.addLayout(row_gauges)
 
         self.card_energy = EnergyCard()
 
-        col1.addWidget(card_params, 1)
-        col1.addWidget(self.card_energy, 0)
+        col1.addWidget(card_params, 0)
+        col1.addWidget(self.card_energy, 1)
 
         # --- KOLOM 2: Panel tengah ---
         col2_card = self.make_card()
@@ -2216,7 +2344,7 @@ class DashboardPage(QWidget):
 
         # jam tepat di tengah (kiri & kanan memakai stretch sama), suhu luar di kanan
         clock_row = QHBoxLayout()
-        clock_row.setContentsMargins(S(10), 0, S(10), 0)
+        clock_row.setContentsMargins(S(14), 0, S(14), 0)
         clock_left = QWidget()
         clock_left.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         amb_w = QWidget()
@@ -2225,7 +2353,7 @@ class DashboardPage(QWidget):
         amb_l.setContentsMargins(0, 0, 0, 0)
         amb_l.setSpacing(S(6))
         amb_l.addStretch()
-        amb_l.addWidget(IconWidget("thermo", 18, GRAY))
+        amb_l.addWidget(IconWidget("thermo", 24, GRAY))
         amb_l.addWidget(self.lbl_ambient)
         clock_row.addWidget(clock_left, 1)
         clock_row.addWidget(self.lbl_big_clock, 0)
@@ -2261,23 +2389,12 @@ class DashboardPage(QWidget):
 
         root.addLayout(main_layout, stretch=1)
 
-        # 3. Pill status (netral saat normal, berwarna hanya saat bermasalah)
-        bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(S(10))
-
-        self.pill_tire = StatusPill("tire")
-        self.pill_bat = StatusPill("bolt")
-        self.pill_sec = StatusPill("shield")
-
-        self.pill_tire.set_state("SEMUA BAN NORMAL", "", NEUTRAL_SCHEME, GREEN)
-        self.pill_bat.set_state("BATERAI: BATTERY HOLD", "", NEUTRAL_SCHEME, CYAN)
-        self.pill_sec.set_state("KEAMANAN AMAN", "", NEUTRAL_SCHEME, GREEN)
-
-        bottom_row.addWidget(self.pill_tire, 1)
-        bottom_row.addWidget(self.pill_bat, 1)
-        bottom_row.addWidget(self.pill_sec, 1)
-
-        root.addLayout(bottom_row)
+        # 3. Status bar bersegmen (netral saat normal; segmen berwarna hanya saat ada masalah)
+        self.status_bar = StatusBar(["tire", "bolt", "shield"])
+        self.status_bar.set_slot(0, "SEMUA BAN NORMAL", "", NEUTRAL_SCHEME, GREEN)
+        self.status_bar.set_slot(1, "BATERAI: BATTERY HOLD", "", NEUTRAL_SCHEME, CYAN)
+        self.status_bar.set_slot(2, "KEAMANAN AMAN", "", NEUTRAL_SCHEME, GREEN)
+        root.addWidget(self.status_bar)
 
         self._set_mode_buttons("ICE")
 
@@ -2318,16 +2435,18 @@ class DashboardPage(QWidget):
         self.on_drive_mode_change(mode_key)
 
     def update_status_pills(self, d, drive_mode, soc):
-        # --- ban (TPMS): subjudul hanya muncul saat ada masalah ---
+        sb = self.status_bar
+
+        # --- ban (TPMS): keterangan hanya muncul saat ada masalah ---
         tpms = d.get("tpms", [33, 33, 37, 37])
         names = ["FL", "FR", "RL", "RR"]
         bad = [(n, v) for n, v in zip(names, tpms) if not (30 <= v <= 40)]
         if not bad:
-            self.pill_tire.set_state("SEMUA BAN NORMAL", "", NEUTRAL_SCHEME, GREEN)
+            sb.set_slot(0, "SEMUA BAN NORMAL", "", NEUTRAL_SCHEME, GREEN)
         else:
             critical = any(v < 25 or v > 45 for _, v in bad)
-            self.pill_tire.set_state("PERIKSA BAN", ", ".join(f"{n} {v} PSI" for n, v in bad),
-                                     BAD_SCHEME if critical else WARN_SCHEME)
+            sb.set_slot(0, "PERIKSA BAN", ", ".join(f"{n} {v} PSI" for n, v in bad),
+                        BAD_SCHEME if critical else WARN_SCHEME)
 
         # --- baterai: mode energi = info netral; amber/merah hanya jika SOC rendah ---
         em_key = d.get("energy_mode", "REGENERATIVE_READY")
@@ -2336,26 +2455,26 @@ class DashboardPage(QWidget):
         else:
             em_txt, _, _ = MODE_ENERGY_EV.get(em_key, MODE_ENERGY_EV["IDLE"])
         if soc < 10:
-            self.pill_bat.set_state(f"BATERAI KRITIS ({soc}%)", "segera isi daya", BAD_SCHEME)
+            sb.set_slot(1, f"BATERAI KRITIS ({soc}%)", "segera isi daya", BAD_SCHEME)
         elif soc < 20:
-            self.pill_bat.set_state(f"BATERAI RENDAH ({soc}%)", "segera isi daya", WARN_SCHEME)
+            sb.set_slot(1, f"BATERAI RENDAH ({soc}%)", "segera isi daya", WARN_SCHEME)
         else:
-            self.pill_bat.set_state(f"BATERAI: {em_txt}", "", NEUTRAL_SCHEME, CYAN)
+            sb.set_slot(1, f"BATERAI: {em_txt}", "", NEUTRAL_SCHEME, CYAN)
 
         # --- keamanan (pintu per posisi & sabuk) ---
         flags = get_doors(d)
-        names = [n for n, f in zip(DOOR_NAMES, flags) if f]
+        door_names = [n for n, f in zip(DOOR_NAMES, flags) if f]
         door_open = any(flags) or ("doors" not in d and bool(d.get("door", False)))
-        door_sub = ", ".join(names)
+        door_sub = ", ".join(door_names)
         belt = bool(d.get("belt", True))
         if door_open and not belt:
-            self.pill_sec.set_state("PINTU TERBUKA & SABUK BELUM DIPASANG", door_sub, BAD_SCHEME)
+            sb.set_slot(2, "PINTU TERBUKA & SABUK BELUM DIPASANG", door_sub, BAD_SCHEME)
         elif door_open:
-            self.pill_sec.set_state("PINTU TERBUKA", door_sub or "tutup pintu sebelum berkendara", BAD_SCHEME)
+            sb.set_slot(2, "PINTU TERBUKA", door_sub or "tutup pintu sebelum berkendara", BAD_SCHEME)
         elif not belt:
-            self.pill_sec.set_state("SABUK BELUM DIPASANG", "pasang sabuk pengaman", WARN_SCHEME)
+            sb.set_slot(2, "SABUK BELUM DIPASANG", "pasang sabuk pengaman", WARN_SCHEME)
         else:
-            self.pill_sec.set_state("KEAMANAN AMAN", "", NEUTRAL_SCHEME, GREEN)
+            sb.set_slot(2, "KEAMANAN AMAN", "", NEUTRAL_SCHEME, GREEN)
 
     def render(self, d):
         speed = float(d["speed"])
@@ -2569,12 +2688,14 @@ class EVDashboardMain(QMainWindow):
 
 
 def parse_args(argv):
-    port, fullscreen, scale = None, False, None
+    port, fullscreen, scale, windowed = None, False, None, False
     i = 1
     while i < len(argv):
         a = argv[i]
         if a in ("--fullscreen", "-f"):
             fullscreen = True
+        elif a in ("--window", "-w"):
+            windowed = True
         elif a == "--scale" and i + 1 < len(argv):
             try:
                 scale = float(argv[i + 1])
@@ -2584,27 +2705,31 @@ def parse_args(argv):
         elif not a.startswith("-"):
             port = a
         i += 1
-    return port, fullscreen, scale
+    return port, fullscreen, scale, windowed
 
 
 if __name__ == "__main__":
-    port_arg, fullscreen, scale_arg = parse_args(sys.argv)
+    port_arg, fullscreen, scale_arg, windowed = parse_args(sys.argv)
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv[:1])
 
     avail = app.primaryScreen().availableGeometry()
     if fullscreen:
         win_w, win_h = avail.width(), avail.height()
-    else:
+    elif windowed:
         win_w = min(BASE_W, avail.width() - 40)
         win_h = min(BASE_H, avail.height() - 60)
+    else:                                   # default: jendela maksimal (dikurangi tinggi title bar)
+        win_w, win_h = avail.width(), avail.height() - 40
 
     # faktor skala global: mengikuti ukuran jendela/layar terhadap resolusi acuan
-    UI["scale"] = scale_arg if scale_arg else max(0.8, min(1.6, min(win_w / BASE_W, win_h / BASE_H)))
+    UI["scale"] = scale_arg if scale_arg else max(0.8, min(1.8, min(win_w / BASE_W, win_h / BASE_H)))
 
     window = EVDashboardMain(port_arg, win_w, win_h)
     if fullscreen:
         window.showFullScreen()
-    else:
+    elif windowed:
         window.show()
+    else:
+        window.showMaximized()
     sys.exit(app.exec_())
