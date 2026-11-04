@@ -60,6 +60,7 @@ DEMO_SPEEDUP = 25.0         # percepatan waktu simulator supaya perubahan terlih
 # Palet: satu warna aksen (CYAN). Hijau/amber/merah hanya untuk STATUS.
 GREEN, AMBER, RED, CYAN, GRAY = "#22c55e", "#f59e0b", "#ef4444", "#38bdf8", "#94a3b8"
 MUTED = "#475569"
+SUBTLE = "#8b9ab3"          # teks keterangan (kontras lebih tinggi dari #64748b)
 
 # --- Sensor oksigen wideband: AFR (rasio udara : bahan bakar, bensin) ---
 STOICH_AFR = 14.7                       # campuran ideal (lambda = 1.00)
@@ -1024,22 +1025,39 @@ class Simulator:
 # ---------------------------------------------------------
 # Custom Gauges
 # ---------------------------------------------------------
+def current_color(v):
+    """Warna busur arus mengikuti status: normal / waspada / tinggi."""
+    return RED if v >= 100 else (AMBER if v >= 80 else CYAN)
+
+
+def voltage_color(v):
+    """Warna busur tegangan mengikuti status: normal / waspada / rendah-tinggi."""
+    if v < 62 or v > 84:
+        return RED
+    return AMBER if v < 66 else CYAN
+
+
 class ArcMeter(QWidget):
-    def __init__(self, val_unit="A", max_val=120, color=CYAN, parent=None):
+    """Gauge busur 270 derajat (gaya sama dengan speedometer), animasi halus, warna sesuai status."""
+    START = 225.0
+    SPAN = 270.0
+
+    def __init__(self, val_unit="A", max_val=120, color=CYAN, color_fn=None, parent=None):
         super().__init__(parent)
         self.value = 0.0            # nilai yang digambar (dianimasikan)
         self.target = 0.0           # nilai sebenarnya
         self.val_unit = val_unit
         self.max_val = max_val
         self.color = QColor(color)
-        self.setMinimumSize(S(120), S(90))
+        self.color_fn = color_fn
+        self.setMinimumSize(S(130), S(130))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._anim = QTimer(self)
         self._anim.setInterval(16)
         self._anim.timeout.connect(self._step)
 
     def sizeHint(self):
-        return QSize(S(190), S(135))
+        return QSize(S(200), S(190))
 
     def set_value(self, v):
         self.target = max(0.0, min(float(self.max_val), v))
@@ -1061,42 +1079,44 @@ class ArcMeter(QWidget):
         p.setRenderHint(QPainter.TextAntialiasing)
 
         w, h = self.width(), self.height()
-        cx = w / 2
-        r = max(S(30), min(w / 2 - S(16), h - S(40)))
-        pw = max(S(7), r * 0.09)
+        label_h = S(16)
 
-        # blok gauge (busur + label batas) dipusatkan secara vertikal
-        block_h = r + pw + S(24)
-        y_top = max(0.0, (h - block_h) / 2)
-        cy = y_top + pw / 2 + r
+        # busur 270 derajat butuh tinggi ~1.707*r (bagian bawah terbuka); label batas di ujung busur
+        r0 = min(w / 2.0, (h - label_h) / 1.707)
+        pw = max(S(8), r0 * 0.11)
+        r = max(S(30), min((w - pw) / 2.0 - S(2), (h - pw - label_h) / 1.707))
+        cx = w / 2.0
+        cy = h / 2.0 + 0.146 * r - label_h / 2.0       # pusatkan blok busur + label secara vertikal
         rect = QRectF(cx - r, cy - r, 2 * r, 2 * r)
 
         p.setPen(QPen(QColor("#1e293b"), pw, Qt.SolidLine, Qt.RoundCap))
-        p.drawArc(rect, 0 * 16, 180 * 16)
+        p.drawArc(rect, int(self.START * 16), int(-self.SPAN * 16))
 
-        if self.value > 0.05:
-            ratio = self.value / self.max_val
-            span_deg = ratio * 180
-            p.setPen(QPen(self.color, pw, Qt.SolidLine, Qt.RoundCap))
-            p.drawArc(rect, 180 * 16, int(-span_deg * 16))
+        ratio = self.value / self.max_val if self.max_val else 0.0
+        if ratio * self.SPAN > 2.0:
+            col = QColor(self.color_fn(self.value)) if self.color_fn else self.color
+            p.setPen(QPen(col, pw, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(rect, int(self.START * 16), int(-self.SPAN * ratio * 16))
 
-            angle_rad = math.radians(180 - span_deg)
-            dot_x = cx + r * math.cos(angle_rad)
-            dot_y = cy - r * math.sin(angle_rad)
+            a = math.radians(self.START - self.SPAN * ratio)
             p.setPen(Qt.NoPen)
             p.setBrush(QColor("#ffffff"))
-            p.drawEllipse(QPointF(dot_x, dot_y), pw * 0.6, pw * 0.6)
+            p.drawEllipse(QPointF(cx + r * math.cos(a), cy - r * math.sin(a)), pw * 0.6, pw * 0.6)
 
-        # nilai ditampilkan dari data sebenarnya (bukan nilai animasi)
+        # angka (data sebenarnya) + satuan di tengah, seperti speedometer
         p.setPen(QColor("#ffffff"))
-        p.setFont(rfont(r * 0.30, True))
-        p.drawText(QRectF(0, cy - r * 0.64, w, r * 0.42), Qt.AlignCenter, f"{self.target:.1f} {self.val_unit}")
-
+        p.setFont(rfont(r * 0.40, True))
+        p.drawText(QRectF(cx - r, cy - r * 0.55, 2 * r, r * 0.62), Qt.AlignCenter, f"{self.target:.1f}")
         p.setPen(QColor(GRAY))
+        p.setFont(rfont(r * 0.19, True))
+        p.drawText(QRectF(cx - r, cy + r * 0.14, 2 * r, r * 0.28), Qt.AlignCenter, self.val_unit)
+
+        # batas skala di bawah ujung busur
         p.setFont(font(11))
-        p.drawText(QRectF(cx - r - pw, cy + S(6), S(54), S(16)), Qt.AlignLeft, "0" + self.val_unit)
-        p.drawText(QRectF(cx + r - S(54) + pw, cy + S(6), S(54), S(16)), Qt.AlignRight,
-                   f"{self.max_val}" + self.val_unit)
+        ex = r * 0.7071
+        ey = cy + ex + pw / 2 + S(2)
+        p.drawText(QRectF(cx - ex - S(24), ey, S(48), label_h), Qt.AlignCenter, "0")
+        p.drawText(QRectF(cx + ex - S(24), ey, S(48), label_h), Qt.AlignCenter, str(self.max_val))
 
 
 class SpeedGauge(QWidget):
@@ -1190,8 +1210,8 @@ class SpeedGauge(QWidget):
                 p.setPen(Qt.NoPen)
                 p.setBrush(QColor(GREEN))
             else:
-                p.setPen(QPen(QColor("#2a3b5c"), 1))
-                p.setBrush(QColor("#16223a"))
+                p.setPen(QPen(QColor("#3b4f78"), 1.2))
+                p.setBrush(QColor("#1e2d4a"))
             p.drawPath(path)
 
         arrow(cx - dx, 1.0, lit_left)
@@ -1207,10 +1227,10 @@ class SpeedGauge(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(RED))
         else:
-            p.setPen(QPen(QColor("#2a3b5c"), 1))
-            p.setBrush(QColor("#16223a"))
+            p.setPen(QPen(QColor("#3b4f78"), 1.2))
+            p.setBrush(QColor("#1e2d4a"))
         p.drawPath(tri)
-        p.setPen(QPen(QColor("#ffffff" if lit_haz else "#334155"), max(1.5, u * 0.16),
+        p.setPen(QPen(QColor("#ffffff" if lit_haz else "#4a5f85"), max(1.5, u * 0.16),
                       Qt.SolidLine, Qt.RoundCap))
         p.drawLine(QPointF(cx, y - u * 0.35), QPointF(cx, y + u * 0.2))
         p.drawLine(QPointF(cx, y + u * 0.5), QPointF(cx, y + u * 0.52))
@@ -1374,7 +1394,7 @@ class ConsumptionCard(QFrame):
         row, _ = make_card_head("chart", "Konsumsi Energi", CYAN)
         left.addLayout(row)
         self.lbl_avg = QLabel("Rata-rata 20 Wh")
-        self.lbl_avg.setStyleSheet(label_qss("#64748b", 12, False, f"margin-left: {S(24)}px;"))
+        self.lbl_avg.setStyleSheet(label_qss(SUBTLE, 12, False, f"margin-left: {S(24)}px;"))
         left.addWidget(self.lbl_avg)
         self.lbl_cur = QLabel("20 Wh")
         self.lbl_cur.setStyleSheet(label_qss(CYAN, 22, True))
@@ -1881,9 +1901,9 @@ class EnergyRow(QWidget):
 
         sub = QHBoxLayout()
         self.lbl_sub_l = QLabel()
-        self.lbl_sub_l.setStyleSheet(label_qss("#64748b", 12))
+        self.lbl_sub_l.setStyleSheet(label_qss(SUBTLE, 12))
         self.lbl_sub_r = QLabel()
-        self.lbl_sub_r.setStyleSheet(label_qss("#64748b", 12))
+        self.lbl_sub_r.setStyleSheet(label_qss(SUBTLE, 12))
         sub.addWidget(self.lbl_sub_l)
         sub.addStretch()
         sub.addWidget(self.lbl_sub_r)
@@ -1914,21 +1934,21 @@ class EnergyRow(QWidget):
 
 
 class EnergyCard(QFrame):
+    """Tiga baris metrik (SOH, jarak, bensin); tiap baris sudah punya ikon & judul sendiri."""
+
     def __init__(self):
         super().__init__()
         self.setObjectName("card")
         self.setStyleSheet(card_style())
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(S(16), S(12), S(16), S(12))
-        lay.setSpacing(S(4))
+        lay.setContentsMargins(S(16), S(8), S(16), S(8))
+        lay.setSpacing(S(2))
 
-        head, _ = make_card_head("battery", "Energi", CYAN)
         self.row_soh = EnergyRow("battery", "Battery Health", "%", 100)
         self.row_range = EnergyRow("pin", "Estimasi Jarak", "km", MAX_RANGE_KM)
         self.row_fuel = EnergyRow("fuel", "Fuel Tank", "%", 100)
 
-        lay.addLayout(head)
         lay.addWidget(self.row_soh, 1)
         lay.addWidget(self._divider())
         lay.addWidget(self.row_range, 1)
@@ -1946,18 +1966,19 @@ class EnergyCard(QFrame):
 # HALAMAN 1: AUTENTIKASI
 # ---------------------------------------------------------
 class AuthTile(QPushButton):
-    """Tile login besar dengan ikon vektor (pengganti emoji)."""
+    """Tile login: ikon + judul + keterangan di atas, petunjuk singkat di bawah."""
 
-    def __init__(self, icon, title, subtitle, parent=None):
+    def __init__(self, icon, title, subtitle, hint, parent=None):
         super().__init__(parent)
         self.icon_name = icon
         self.title = title
         self.subtitle = subtitle
+        self.hint = hint
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_Hover, True)
-        self.setMinimumHeight(S(180))
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumHeight(S(290))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -1969,15 +1990,28 @@ class AuthTile(QPushButton):
         p.setBrush(QColor("#0c4a6e" if hover else "#152238"))
         p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), S(14), S(14))
 
+        # kelompok atas (posisi sama dengan kotak input manual supaya sejajar)
         ic = S(56)
-        top = h * 0.5 - (ic + S(60)) / 2
-        draw_icon(p, self.icon_name, QRectF(w / 2 - ic / 2, top, ic, ic), "#38bdf8", 1.6)
+        top = S(34)
+        draw_icon(p, self.icon_name, QRectF(w / 2 - ic / 2, top, ic, ic), "#38bdf8", 1.7)
         p.setPen(QColor("#ffffff"))
         p.setFont(font(15, True))
-        p.drawText(QRectF(0, top + ic + S(10), w, S(24)), Qt.AlignCenter, self.title)
+        p.drawText(QRectF(0, top + ic + S(12), w, S(24)), Qt.AlignCenter, self.title)
         p.setPen(QColor(GRAY))
         p.setFont(font(12))
-        p.drawText(QRectF(0, top + ic + S(36), w, S(20)), Qt.AlignCenter, self.subtitle)
+        p.drawText(QRectF(0, top + ic + S(38), w, S(20)), Qt.AlignCenter, self.subtitle)
+
+        # petunjuk di bawah
+        hf = font(12)
+        cw = text_width(hf, self.hint) + S(36)
+        ch = S(34)
+        chip = QRectF(w / 2 - cw / 2, h - S(26) - ch, cw, ch)
+        p.setPen(QPen(QColor("#2a3b5c"), 1))
+        p.setBrush(QColor("#0f1a2e"))
+        p.drawRoundedRect(chip, ch / 2, ch / 2)
+        p.setPen(QColor(SUBTLE))
+        p.setFont(hf)
+        p.drawText(chip, Qt.AlignCenter, self.hint)
 
 
 class AuthPage(QWidget):
@@ -1988,13 +2022,14 @@ class AuthPage(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(S(40), S(40), S(40), S(40))
+        layout.setContentsMargins(S(40), S(30), S(40), S(30))
 
         card = QFrame()
         card.setObjectName("card")
         card.setStyleSheet(card_style("#334155", 2))
+        card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)      # setinggi isinya
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(S(30), S(30), S(30), S(30))
+        card_layout.setContentsMargins(S(30), S(28), S(30), S(30))
 
         hdr = QHBoxLayout()
         logo_l = make_logo(LOGO_POLIBATAM, 64, True, "POLIBATAM")
@@ -2024,27 +2059,34 @@ class AuthPage(QWidget):
         for c in range(3):
             grid.setColumnStretch(c, 1)
 
-        tile_finger = AuthTile("fingerprint", "PINDAI SIDIK JARI", "Fingerprint Sensor")
+        tile_finger = AuthTile("fingerprint", "PINDAI SIDIK JARI", "Fingerprint Sensor",
+                               "Letakkan jari pada sensor")
         tile_finger.clicked.connect(lambda: self.verify_access("Fingerprint Terverifikasi", "Pengemudi: Atmarahil Satyaki"))
 
-        tile_rfid = AuthTile("card", "TEMPELKAN KARTU", "RFID / NFC Tag")
+        tile_rfid = AuthTile("card", "TEMPELKAN KARTU", "RFID / NFC Tag",
+                             "Dekatkan kartu ke pembaca")
         tile_rfid.clicked.connect(lambda: self.verify_access("Kartu RFID Terverifikasi", "E-KTM Polibatam: 3112301001"))
 
+        # kotak input manual: pola sama dengan tile (ikon, judul, keterangan di atas; aksi di bawah)
         manual_box = QFrame()
         manual_box.setObjectName("manual")
         manual_box.setStyleSheet(f"QFrame#manual {{ background-color: #152238; border: 2px solid #22304f; "
                                  f"border-radius: {S(14)}px; }}")
         v_man = QVBoxLayout(manual_box)
-        v_man.setContentsMargins(S(18), S(16), S(18), S(16))
-        v_man.setSpacing(S(10))
+        v_man.setContentsMargins(S(20), S(34), S(20), S(26))
+        v_man.setSpacing(S(6))
 
-        man_head = QHBoxLayout()
-        man_head.setSpacing(S(8))
-        man_head.addWidget(IconWidget("key", 22, CYAN))
-        lbl_man = QLabel("INPUT MANUAL (NIP / PIN)")
-        lbl_man.setStyleSheet(label_qss("#cbd5e1", 12, True))
-        man_head.addWidget(lbl_man)
-        man_head.addStretch()
+        v_man.addWidget(IconWidget("key", 56, "#38bdf8"), 0, Qt.AlignHCenter)
+        v_man.addSpacing(S(6))
+        lbl_title = QLabel("INPUT MANUAL")
+        lbl_title.setAlignment(Qt.AlignCenter)
+        lbl_title.setStyleSheet(label_qss("#ffffff", 15, True))
+        lbl_sub = QLabel("NIP / NIM / PIN")
+        lbl_sub.setAlignment(Qt.AlignCenter)
+        lbl_sub.setStyleSheet(label_qss(GRAY, 12))
+        v_man.addWidget(lbl_title)
+        v_man.addWidget(lbl_sub)
+        v_man.addStretch(1)
 
         self.txt_pin = QLineEdit()
         self.txt_pin.setPlaceholderText("Masukkan PIN / NIM / NIP...")
@@ -2062,20 +2104,20 @@ class AuthPage(QWidget):
         """)
         btn_pin.clicked.connect(self.check_pin)
 
-        v_man.addLayout(man_head)
-        v_man.addStretch()
         v_man.addWidget(self.txt_pin)
+        v_man.addSpacing(S(4))
         v_man.addWidget(btn_pin)
-        v_man.addStretch()
 
         grid.addWidget(tile_finger, 0, 0)
         grid.addWidget(tile_rfid, 0, 1)
         grid.addWidget(manual_box, 0, 2)
 
         card_layout.addLayout(grid)
-        card_layout.addStretch()
 
+        # kartu dipusatkan secara vertikal di jendela
+        layout.addStretch(1)
         layout.addWidget(card)
+        layout.addStretch(1)
 
     def check_pin(self):
         pin = self.txt_pin.text().strip()
@@ -2259,7 +2301,6 @@ class DashboardPage(QWidget):
         col1.setSpacing(S(10))
 
         card_params = self.make_card()
-        card_params.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         cp_lay = QVBoxLayout(card_params)
         cp_lay.setContentsMargins(S(16), S(12), S(16), S(10))
         cp_lay.setSpacing(S(6))
@@ -2267,9 +2308,9 @@ class DashboardPage(QWidget):
         head, self.lbl_power = make_card_head("bolt", "Battery Parameters", CYAN, with_value=True)
         self.lbl_power.setText("0.00 kW")
 
-        self.meter_current = ArcMeter("A", 120, CYAN)
+        self.meter_current = ArcMeter("A", 120, CYAN, current_color)
         cell_i, self.chip_i = self._gauge_cell("Arus", self.meter_current)
-        self.meter_voltage = ArcMeter("V", VOLT_MAX_SCALE, CYAN)
+        self.meter_voltage = ArcMeter("V", VOLT_MAX_SCALE, CYAN, voltage_color)
         cell_v, self.chip_v = self._gauge_cell("Tegangan", self.meter_voltage)
 
         vdiv = QFrame()
@@ -2283,11 +2324,12 @@ class DashboardPage(QWidget):
         row_gauges.addLayout(cell_v, 1)
 
         cp_lay.addLayout(head)
-        cp_lay.addLayout(row_gauges)
+        cp_lay.addSpacing(S(10))
+        cp_lay.addLayout(row_gauges, 1)
 
         self.card_energy = EnergyCard()
 
-        col1.addWidget(card_params, 0)
+        col1.addWidget(card_params, 1)
         col1.addWidget(self.card_energy, 1)
 
         # --- KOLOM 2: Panel tengah ---
