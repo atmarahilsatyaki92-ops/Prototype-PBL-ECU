@@ -384,6 +384,73 @@ def get_doors(d):
     return [False, False, False, False]
 
 
+def compute_telltales(d, drive_mode, soc):
+    """
+    Tentukan level tiap lampu indikator dan pesan prioritas tertinggi.
+    Level: 0 normal | 1 waspada (amber) | 2 bahaya (merah) | 3 bahaya + berkedip (saat kendaraan melaju).
+    Return (levels, teks_pesan, level_pesan).
+    """
+    speed = float(d.get("speed", 0.0))
+    moving = speed > 5.0
+    levels = {k: 0 for k in ("seatbelt", "door", "tire", "battery", "engine", "thermo")}
+    alerts = []                                   # (level, urutan prioritas, teks)
+
+    # pintu (per posisi bila tersedia)
+    flags = get_doors(d)
+    names = [n for n, f in zip(DOOR_NAMES, flags) if f]
+    if any(flags) or ("doors" not in d and bool(d.get("door", False))):
+        levels["door"] = 3 if moving else 2
+        alerts.append((levels["door"], 0, "PINTU TERBUKA" + (" • " + ", ".join(names) if names else "")))
+
+    # sabuk pengaman
+    if not bool(d.get("belt", True)):
+        levels["seatbelt"] = 3 if moving else 2
+        alerts.append((levels["seatbelt"], 1, "SABUK BELUM DIPASANG"))
+
+    # tekanan ban
+    tpms = d.get("tpms", [33, 33, 37, 37])
+    bad = [(n, v) for n, v in zip(("FL", "FR", "RL", "RR"), tpms) if not (30 <= v <= 40)]
+    if bad:
+        critical = any(v < 25 or v > 45 for _, v in bad)
+        levels["tire"] = 2 if critical else 1
+        alerts.append((levels["tire"], 2, "PERIKSA BAN • " + ", ".join(f"{n} {v} PSI" for n, v in bad)))
+
+    # baterai
+    if soc < 10:
+        levels["battery"] = 2
+        alerts.append((2, 3, f"BATERAI KRITIS ({soc}%) • segera isi daya"))
+    elif soc < 20:
+        levels["battery"] = 1
+        alerts.append((1, 3, f"BATERAI RENDAH ({soc}%) • segera isi daya"))
+
+    # mesin: hanya campuran ekstrem (agar pengayaan saat akselerasi tidak menyalakan lampu)
+    afr = d.get("afr")
+    if afr is not None and (float(afr) < AFR_BANDS[0][1] or float(afr) >= AFR_BANDS[-1][0]):
+        levels["engine"] = 1
+        alerts.append((1, 4, f"CAMPURAN BAHAN BAKAR TIDAK NORMAL • AFR {float(afr):.1f}"))
+
+    # suhu baterai
+    bt = float(d.get("bat_temp", 32.0))
+    if bt >= 55:
+        levels["thermo"] = 2
+        alerts.append((2, 5, f"SUHU BATERAI KRITIS • {bt:.0f}°C"))
+    elif bt >= 45:
+        levels["thermo"] = 1
+        alerts.append((1, 5, f"SUHU BATERAI TINGGI • {bt:.0f}°C"))
+
+    if alerts:
+        alerts.sort(key=lambda a: (-a[0], a[1]))
+        top = alerts[0]
+        text = top[2] + (f"   (+{len(alerts) - 1} lainnya)" if len(alerts) > 1 else "")
+        text_level = min(top[0], 2)
+    else:
+        table = MODE_ENERGY_ICE if drive_mode == "ICE" else MODE_ENERGY_EV
+        em_txt = table.get(d.get("energy_mode", ""), next(iter(table.values())))[0]
+        text = f"Semua sistem normal  •  Baterai: {em_txt}"
+        text_level = 0
+    return levels, text, text_level
+
+
 # ---------------------------------------------------------
 # Ikon Vektor (digambar dengan QPainter, tanpa emoji)
 # ---------------------------------------------------------
@@ -605,6 +672,41 @@ def draw_icon(p, name, rect, color, lw=1.8):
         p.drawLine(QPointF(18, 12), QPointF(18, 15.5))
         p.drawLine(QPointF(21, 12), QPointF(21, 14.5))
 
+    elif name == "seatbelt":
+        p.drawEllipse(QPointF(9.5, 5.2), 2.3, 2.3)
+        torso = QPainterPath()
+        torso.moveTo(9.5, 8.6)
+        torso.lineTo(9.5, 15.5)
+        torso.lineTo(16.5, 15.5)
+        torso.lineTo(16.5, 20.5)
+        p.drawPath(torso)
+        p.drawLine(QPointF(14.0, 8.8), QPointF(7.0, 15.5))
+
+    elif name == "door":
+        p.drawRoundedRect(QRectF(9.5, 3, 11, 18), 3, 3)
+        door = QPainterPath()
+        door.moveTo(9.5, 8.5)
+        door.lineTo(3.5, 11.5)
+        door.lineTo(3.5, 17)
+        door.lineTo(9.5, 15.5)
+        p.drawPath(door)
+
+    elif name == "tpms":
+        p.drawArc(QRectF(4, 3, 16, 16), -30 * 16, 240 * 16)
+        p.drawLine(QPointF(6.5, 20.5), QPointF(17.5, 20.5))
+        p.drawLine(QPointF(12, 7.5), QPointF(12, 12.5))
+        p.drawLine(QPointF(12, 15), QPointF(12, 15.2))
+
+    elif name == "engine":
+        p.drawRoundedRect(QRectF(6, 9, 12, 9), 1.5, 1.5)
+        p.drawLine(QPointF(9, 9), QPointF(9, 6))
+        p.drawLine(QPointF(9, 6), QPointF(15, 6))
+        p.drawLine(QPointF(15, 6), QPointF(15, 9))
+        p.drawLine(QPointF(3.5, 12), QPointF(6, 12))
+        p.drawLine(QPointF(3.5, 10.5), QPointF(3.5, 15))
+        p.drawLine(QPointF(18, 12.5), QPointF(20.5, 12.5))
+        p.drawLine(QPointF(20.5, 10.5), QPointF(20.5, 15))
+
     p.restore()
 
 
@@ -755,22 +857,46 @@ class ModeButton(QPushButton):
         p.drawText(QRectF(S(25), 0, w - S(28), h), Qt.AlignCenter, self.text())
 
 
-class StatusBar(QWidget):
-    """Status bar bersegmen (satu baris): netral saat normal, hanya segmen bermasalah yang berwarna."""
+class TelltaleBar(QWidget):
+    """
+    Lampu indikator (telltale) + satu baris pesan prioritas tertinggi.
+    Lampu redup saat normal; amber = waspada; merah = bahaya (berkedip saat kendaraan melaju).
+    """
+    LAMPS = ["seatbelt", "door", "tire", "battery", "engine", "thermo"]
+    ICONS = {"seatbelt": "seatbelt", "door": "door", "tire": "tpms",
+             "battery": "battery", "engine": "engine", "thermo": "thermo"}
 
-    def __init__(self, icons, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.slots = [{"icon": ic, "title": "", "sub": "", "scheme": NEUTRAL_SCHEME,
-                       "icon_color": GREEN, "key": None} for ic in icons]
-        self.setFixedHeight(S(40))
+        self.levels = {k: 0 for k in self.LAMPS}
+        self.text = ""
+        self.text_level = 0
+        self._key = None
+        self._phase = True
+        self._blink = QTimer(self)
+        self._blink.setInterval(450)
+        self._blink.timeout.connect(self._on_blink)
+        self._blink.start()
+        self.setFixedHeight(S(44))
+        self.setMaximumWidth(S(1000))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-    def set_slot(self, idx, title, sub, scheme, icon_color=None):
-        slot = self.slots[idx]
-        key = (title, sub, scheme, icon_color)
-        if slot["key"] == key:
+    def sizeHint(self):
+        return QSize(S(1000), S(44))
+
+    def _on_blink(self):
+        self._phase = not self._phase
+        if any(v == 3 for v in self.levels.values()):
+            self.update()
+
+    def set_state(self, levels, text, text_level):
+        key = (tuple(sorted(levels.items())), text, text_level)
+        if key == self._key:
             return
-        slot.update(key=key, title=title, sub=sub, scheme=scheme, icon_color=icon_color or scheme[1])
+        self._key = key
+        self.levels = dict(levels)
+        self.text = text
+        self.text_level = text_level
         self.update()
 
     def paintEvent(self, event):
@@ -778,63 +904,54 @@ class StatusBar(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
         w, h = float(self.width()), float(self.height())
-        n = len(self.slots)
-        seg = w / n
-
-        outline = QPainterPath()
-        outline.addRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), h / 2, h / 2)
-
-        # latar + segmen bermasalah diberi warna
-        p.save()
-        p.setClipPath(outline)
-        p.fillRect(QRectF(0, 0, w, h), QColor(NEUTRAL_SCHEME[0]))
-        for i, sl in enumerate(self.slots):
-            if sl["scheme"] != NEUTRAL_SCHEME:
-                p.fillRect(QRectF(i * seg, 0, seg, h), QColor(sl["scheme"][0]))
-        p.restore()
 
         p.setPen(QPen(QColor("#1e293b"), 1.2))
-        p.setBrush(Qt.NoBrush)
-        p.drawPath(outline)
+        p.setBrush(QColor(NEUTRAL_SCHEME[0]))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), h / 2, h / 2)
 
-        # pembatas antar segmen (disembunyikan di sebelah segmen berwarna)
-        for i in range(1, n):
-            if self.slots[i - 1]["scheme"] == NEUTRAL_SCHEME and self.slots[i]["scheme"] == NEUTRAL_SCHEME:
-                p.setPen(QPen(QColor("#1e293b"), 1))
-                p.drawLine(QPointF(i * seg, h * 0.25), QPointF(i * seg, h * 0.75))
+        icon, step, x0 = S(24), S(46), S(32)
+        cy = h / 2
+        for i, key in enumerate(self.LAMPS):
+            level = self.levels.get(key, 0)
+            cx = x0 + i * step
+            col = RED if level >= 2 else (AMBER if level == 1 else None)
+            lit = level > 0 and (level != 3 or self._phase)
+            if lit:
+                g = QRadialGradient(QPointF(cx, cy), icon * 1.15)
+                c1 = QColor(col)
+                c1.setAlpha(90)
+                c0 = QColor(col)
+                c0.setAlpha(0)
+                g.setColorAt(0.0, c1)
+                g.setColorAt(1.0, c0)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(g))
+                p.drawEllipse(QPointF(cx, cy), icon * 1.15, icon * 1.15)
+            draw_icon(p, self.ICONS[key], QRectF(cx - icon / 2, cy - icon / 2, icon, icon),
+                      col if lit else "#3a4e78", 1.8)
 
-        # isi tiap segmen: ikon + judul (+ keterangan di sampingnya bila muat)
-        f_t, f_s = font(12, True), font(11, False)
-        icon, gap = S(18), S(8)
-        for i, sl in enumerate(self.slots):
-            bg, fg, _ = sl["scheme"]
-            avail = seg - S(28) - icon - gap
-            title, sub = sl["title"], sl["sub"]
-            tw = text_width(f_t, title)
-            if tw > avail:
-                title = QFontMetrics(f_t).elidedText(title, Qt.ElideRight, int(avail))
-                tw, sub = text_width(f_t, title), ""
-            sub_w = 0
-            if sub:
-                room = avail - tw - S(14)
-                if room > S(40):
-                    sub = QFontMetrics(f_s).elidedText(sub, Qt.ElideRight, int(room))
-                    sub_w = text_width(f_s, sub)
-                else:
-                    sub = ""
-            group_w = icon + gap + tw + ((S(14) + sub_w) if sub else 0)
-            x = i * seg + (seg - group_w) / 2
-            draw_icon(p, sl["icon"], QRectF(x, (h - icon) / 2, icon, icon), sl["icon_color"], 1.7)
-            tx = x + icon + gap
-            p.setPen(QColor(fg))
-            p.setFont(f_t)
-            p.drawText(QRectF(tx, 0, tw + 4, h), Qt.AlignLeft | Qt.AlignVCenter, title)
-            if sub:
-                c = QColor(fg)
-                c.setAlpha(190)
-                p.setPen(c)
-                p.setFont(f_s)
-                p.drawText(QRectF(tx + tw + S(14), 0, sub_w + 4, h), Qt.AlignLeft | Qt.AlignVCenter, sub)
+        # pembatas + pesan
+        dx = x0 + (len(self.LAMPS) - 1) * step + S(34)
+        p.setPen(QPen(QColor("#1e293b"), 1))
+        p.drawLine(QPointF(dx, h * 0.25), QPointF(dx, h * 0.75))
+
+        if self.text_level >= 2:
+            tcol = RED
+        elif self.text_level == 1:
+            tcol = AMBER
+        else:
+            tcol = GREEN
+        text_x = dx + S(18)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(tcol))
+        p.drawEllipse(QPointF(text_x + S(4), cy), S(4), S(4))
+
+        f = font(12, self.text_level > 0)
+        room = max(0, int(w - text_x - S(18) - S(24)))
+        shown = QFontMetrics(f).elidedText(self.text, Qt.ElideRight, room)
+        p.setPen(QColor(tcol if self.text_level > 0 else "#cbd5e1"))
+        p.setFont(f)
+        p.drawText(QRectF(text_x + S(18), 0, room + S(6), h), Qt.AlignLeft | Qt.AlignVCenter, shown)
 
 
 class ControlDock(QWidget):
@@ -2431,12 +2548,9 @@ class DashboardPage(QWidget):
 
         root.addLayout(main_layout, stretch=1)
 
-        # 3. Status bar bersegmen (netral saat normal; segmen berwarna hanya saat ada masalah)
-        self.status_bar = StatusBar(["tire", "bolt", "shield"])
-        self.status_bar.set_slot(0, "SEMUA BAN NORMAL", "", NEUTRAL_SCHEME, GREEN)
-        self.status_bar.set_slot(1, "BATERAI: BATTERY HOLD", "", NEUTRAL_SCHEME, CYAN)
-        self.status_bar.set_slot(2, "KEAMANAN AMAN", "", NEUTRAL_SCHEME, GREEN)
-        root.addWidget(self.status_bar)
+        # 3. Lampu indikator + pesan prioritas (pill ringkas di tengah bawah)
+        self.status_bar = TelltaleBar()
+        root.addWidget(self.status_bar, 0, Qt.AlignHCenter)
 
         self._set_mode_buttons("ICE")
 
@@ -2477,46 +2591,8 @@ class DashboardPage(QWidget):
         self.on_drive_mode_change(mode_key)
 
     def update_status_pills(self, d, drive_mode, soc):
-        sb = self.status_bar
-
-        # --- ban (TPMS): keterangan hanya muncul saat ada masalah ---
-        tpms = d.get("tpms", [33, 33, 37, 37])
-        names = ["FL", "FR", "RL", "RR"]
-        bad = [(n, v) for n, v in zip(names, tpms) if not (30 <= v <= 40)]
-        if not bad:
-            sb.set_slot(0, "SEMUA BAN NORMAL", "", NEUTRAL_SCHEME, GREEN)
-        else:
-            critical = any(v < 25 or v > 45 for _, v in bad)
-            sb.set_slot(0, "PERIKSA BAN", ", ".join(f"{n} {v} PSI" for n, v in bad),
-                        BAD_SCHEME if critical else WARN_SCHEME)
-
-        # --- baterai: mode energi = info netral; amber/merah hanya jika SOC rendah ---
-        em_key = d.get("energy_mode", "REGENERATIVE_READY")
-        if drive_mode == "ICE":
-            em_txt, _, _ = MODE_ENERGY_ICE.get(em_key, MODE_ENERGY_ICE["REGENERATIVE_READY"])
-        else:
-            em_txt, _, _ = MODE_ENERGY_EV.get(em_key, MODE_ENERGY_EV["IDLE"])
-        if soc < 10:
-            sb.set_slot(1, f"BATERAI KRITIS ({soc}%)", "segera isi daya", BAD_SCHEME)
-        elif soc < 20:
-            sb.set_slot(1, f"BATERAI RENDAH ({soc}%)", "segera isi daya", WARN_SCHEME)
-        else:
-            sb.set_slot(1, f"BATERAI: {em_txt}", "", NEUTRAL_SCHEME, CYAN)
-
-        # --- keamanan (pintu per posisi & sabuk) ---
-        flags = get_doors(d)
-        door_names = [n for n, f in zip(DOOR_NAMES, flags) if f]
-        door_open = any(flags) or ("doors" not in d and bool(d.get("door", False)))
-        door_sub = ", ".join(door_names)
-        belt = bool(d.get("belt", True))
-        if door_open and not belt:
-            sb.set_slot(2, "PINTU TERBUKA & SABUK BELUM DIPASANG", door_sub, BAD_SCHEME)
-        elif door_open:
-            sb.set_slot(2, "PINTU TERBUKA", door_sub or "tutup pintu sebelum berkendara", BAD_SCHEME)
-        elif not belt:
-            sb.set_slot(2, "SABUK BELUM DIPASANG", "pasang sabuk pengaman", WARN_SCHEME)
-        else:
-            sb.set_slot(2, "KEAMANAN AMAN", "", NEUTRAL_SCHEME, GREEN)
+        levels, text, text_level = compute_telltales(d, drive_mode, soc)
+        self.status_bar.set_state(levels, text, text_level)
 
     def render(self, d):
         speed = float(d["speed"])
