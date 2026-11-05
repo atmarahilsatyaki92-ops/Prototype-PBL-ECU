@@ -398,9 +398,11 @@ def compute_telltales(d, drive_mode, soc):
     # pintu (per posisi bila tersedia)
     flags = get_doors(d)
     names = [n for n, f in zip(DOOR_NAMES, flags) if f]
-    if any(flags) or ("doors" not in d and bool(d.get("door", False))):
+    if any(flags) or bool(d.get("door", False)):          # "door" = flag tunggal (firmware lama / ringkasan)
         levels["door"] = 3 if moving else 2
-        alerts.append((levels["door"], 0, "PINTU TERBUKA" + (" • " + ", ".join(names) if names else "")))
+        door_txt = ("SEMUA PINTU TERBUKA" if len(names) == 4
+                    else "PINTU TERBUKA" + (" • " + ", ".join(names) if names else ""))
+        alerts.append((levels["door"], 0, door_txt))
 
     # sabuk pengaman
     if not bool(d.get("belt", True)):
@@ -1730,6 +1732,50 @@ class CarCenterViewDetailed(QWidget):
         else:
             self._paint_car(p, w, h, k)
 
+    def _draw_open_doors(self, p, ix, iy, iw, ih, k):
+        """
+        Pintu terbuka digambar seperti daun pintu yang terayun keluar (tampak atas):
+        satu lengkung tipis merah dari engsel, lintasan ayun putus-putus yang samar, dan titik engsel.
+        """
+        theta = 40.0                                   # sudut bukaan pintu (derajat)
+        t = math.radians(theta)
+        # (indeks pintu, sisi, posisi engsel relatif thd tinggi mobil [atas = depan], panjang daun relatif)
+        specs = [(0, "L", 0.285, 0.19), (1, "R", 0.285, 0.19),
+                 (2, "L", 0.520, 0.17), (3, "R", 0.520, 0.17)]
+        for idx, side, hy_rel, len_rel in specs:
+            if not self.doors[idx]:
+                continue
+            left = side == "L"
+            hx = ix + iw * (0.085 if left else 0.915)
+            hy = iy + ih * hy_rel
+            L = ih * len_rel
+            sgn = -1.0 if left else 1.0
+            ex = hx + sgn * L * math.sin(t)
+            ey = hy + L * math.cos(t)
+
+            # lintasan ayun (garis putus-putus tipis dan samar)
+            p.setPen(QPen(QColor(239, 68, 68, 110), 1.3 * k, Qt.DotLine))
+            p.setBrush(Qt.NoBrush)
+            p.drawArc(QRectF(hx - L, hy - L, 2 * L, 2 * L), int(270 * 16), int((-theta if left else theta) * 16))
+
+            # daun pintu: lengkung kuadratik tipis dengan sedikit cembung ke luar
+            ddx, ddy = ex - hx, ey - hy
+            nx, ny = (-ddy, ddx) if left else (ddy, -ddx)
+            norm = math.hypot(nx, ny) or 1.0
+            bulge = 0.10 * L
+            path = QPainterPath()
+            path.moveTo(hx, hy)
+            path.quadTo((hx + ex) / 2 + nx / norm * bulge, (hy + ey) / 2 + ny / norm * bulge, ex, ey)
+            p.setPen(QPen(QColor(239, 68, 68, 55), 7 * k, Qt.SolidLine, Qt.RoundCap))   # glow
+            p.drawPath(path)
+            p.setPen(QPen(QColor(RED), 2.4 * k, Qt.SolidLine, Qt.RoundCap))
+            p.drawPath(path)
+
+            # engsel
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(RED))
+            p.drawEllipse(QPointF(hx, hy), 2.4 * k, 2.4 * k)
+
     # ---------- TAB: WHOLE CAR ----------
     def _paint_car(self, p, w, h, k):
         margin = 6 * k
@@ -1753,25 +1799,16 @@ class CarCenterViewDetailed(QWidget):
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(QRectF(ix, iy, iw, ih), 22, 22)
 
-        # penanda pintu terbuka (merah) di sisi mobil: atas = depan
+        # pintu terbuka: lengkung tipis di sisi mobil (atas = depan)
         if any(self.doors):
-            mh = ih * 0.17
-            ys = [iy + ih * 0.29, iy + ih * 0.29, iy + ih * 0.51, iy + ih * 0.51]   # FL FR RL RR
-            xs = [ix + iw * 0.08, ix + iw * 0.92, ix + iw * 0.08, ix + iw * 0.92]
-            for is_open, dx, dy in zip(self.doors, xs, ys):
-                if is_open:
-                    p.setPen(Qt.NoPen)
-                    p.setBrush(QColor(239, 68, 68, 70))
-                    p.drawRoundedRect(QRectF(dx - 6 * k, dy - 3 * k, 12 * k, mh + 6 * k), 6 * k, 6 * k)
-                    p.setBrush(QColor(RED))
-                    p.drawRoundedRect(QRectF(dx - 2.5 * k, dy, 5 * k, mh), 2.5 * k, 2.5 * k)
+            self._draw_open_doors(p, ix, iy, iw, ih, k)
 
         # bar baterai (kiri) & suhu baterai (kanan)
-        bar_w = 10 * k
-        bar_h = min(ih * 0.62, area_h * 0.58)
+        bar_w = 6 * k
+        bar_h = min(ih * 0.50, area_h * 0.46)
         bar_y = iy + (ih - bar_h) / 2 - 6 * k
-        x_l = max(w * 0.09, cx - iw / 2 - w * 0.14)
-        x_r = min(w * 0.91 - bar_w, cx + iw / 2 + w * 0.14 - bar_w)
+        x_l = max(w * 0.07, cx - iw / 2 - w * 0.17)
+        x_r = min(w * 0.93 - bar_w, cx + iw / 2 + w * 0.17 - bar_w)
 
         soc_col = QColor(RED if self.soc < 20 else (AMBER if self.soc < 40 else CYAN))
         tmp_col = QColor(RED if self.temp >= 55 else (AMBER if self.temp >= 45 else CYAN))
