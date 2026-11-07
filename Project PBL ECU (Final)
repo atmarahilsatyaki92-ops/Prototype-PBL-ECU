@@ -388,7 +388,7 @@ def compute_telltales(d, drive_mode, soc):
     """
     Tentukan level tiap lampu indikator dan pesan prioritas tertinggi.
     Level: 0 normal | 1 waspada (amber) | 2 bahaya (merah) | 3 bahaya + berkedip (saat kendaraan melaju).
-    Return (levels, teks_pesan, level_pesan).
+    Return (levels, teks_pesan, level_pesan, info_baterai).
     """
     speed = float(d.get("speed", 0.0))
     moving = speed > 5.0
@@ -440,17 +440,22 @@ def compute_telltales(d, drive_mode, soc):
         levels["thermo"] = 1
         alerts.append((1, 5, f"SUHU BATERAI TINGGI • {bt:.0f}°C"))
 
+    # info mode baterai selalu ditampilkan di sisi kanan bar (tidak tertimpa peringatan)
+    table = MODE_ENERGY_ICE if drive_mode == "ICE" else MODE_ENERGY_EV
+    em_txt = table.get(d.get("energy_mode", ""), next(iter(table.values())))[0]
+    info = f"Baterai: {em_txt}"
+
+    short = {0: "Pintu", 1: "Sabuk", 2: "Ban", 3: "Baterai", 4: "Mesin", 5: "Suhu"}
     if alerts:
         alerts.sort(key=lambda a: (-a[0], a[1]))
         top = alerts[0]
-        text = top[2] + (f"   (+{len(alerts) - 1} lainnya)" if len(alerts) > 1 else "")
+        others = [short[a[1]] for a in alerts[1:]]
+        text = top[2] + (f"   (+ {', '.join(others)})" if others else "")
         text_level = min(top[0], 2)
     else:
-        table = MODE_ENERGY_ICE if drive_mode == "ICE" else MODE_ENERGY_EV
-        em_txt = table.get(d.get("energy_mode", ""), next(iter(table.values())))[0]
-        text = f"Semua sistem normal  •  Baterai: {em_txt}"
+        text = "Semua sistem normal"
         text_level = 0
-    return levels, text, text_level
+    return levels, text, text_level, info
 
 
 # ---------------------------------------------------------
@@ -861,7 +866,7 @@ class ModeButton(QPushButton):
 
 class TelltaleBar(QWidget):
     """
-    Lampu indikator (telltale) + satu baris pesan prioritas tertinggi.
+    Lampu indikator (telltale) + satu baris pesan prioritas tertinggi + info mode baterai di kanan.
     Lampu redup saat normal; amber = waspada; merah = bahaya (berkedip saat kendaraan melaju).
     """
     LAMPS = ["seatbelt", "door", "tire", "battery", "engine", "thermo"]
@@ -873,6 +878,7 @@ class TelltaleBar(QWidget):
         self.levels = {k: 0 for k in self.LAMPS}
         self.text = ""
         self.text_level = 0
+        self.info = ""
         self._key = None
         self._phase = True
         self._blink = QTimer(self)
@@ -891,14 +897,15 @@ class TelltaleBar(QWidget):
         if any(v == 3 for v in self.levels.values()):
             self.update()
 
-    def set_state(self, levels, text, text_level):
-        key = (tuple(sorted(levels.items())), text, text_level)
+    def set_state(self, levels, text, text_level, info=""):
+        key = (tuple(sorted(levels.items())), text, text_level, info)
         if key == self._key:
             return
         self._key = key
         self.levels = dict(levels)
         self.text = text
         self.text_level = text_level
+        self.info = info
         self.update()
 
     def paintEvent(self, event):
@@ -932,24 +939,44 @@ class TelltaleBar(QWidget):
             draw_icon(p, self.ICONS[key], QRectF(cx - icon / 2, cy - icon / 2, icon, icon),
                       col if lit else "#3a4e78", 1.8)
 
-        # pembatas + pesan
+        # pembatas setelah lampu
         dx = x0 + (len(self.LAMPS) - 1) * step + S(34)
         p.setPen(QPen(QColor("#1e293b"), 1))
         p.drawLine(QPointF(dx, h * 0.25), QPointF(dx, h * 0.75))
 
+        # info mode baterai di sisi kanan (disembunyikan bila ruang terlalu sempit)
+        text_x = dx + S(18)
+        right_margin = S(30)
+        f_i = font(12, False)
+        info_w = text_width(f_i, self.info) if self.info else 0
+        info_block = (S(16) + S(8) + info_w + S(36)) if self.info else 0     # ikon + jarak + teks + pembatas
+        show_info = bool(self.info) and (w - text_x - S(18) - right_margin - info_block) >= S(220)
+        if show_info:
+            info_x = w - right_margin - info_w
+            ic = S(16)
+            draw_icon(p, "bolt", QRectF(info_x - S(8) - ic, cy - ic / 2, ic, ic), CYAN, 1.8)
+            p.setPen(QColor(SUBTLE))
+            p.setFont(f_i)
+            p.drawText(QRectF(info_x, 0, info_w + S(6), h), Qt.AlignLeft | Qt.AlignVCenter, self.info)
+            div2 = info_x - S(8) - ic - S(16)
+            p.setPen(QPen(QColor("#1e293b"), 1))
+            p.drawLine(QPointF(div2, h * 0.25), QPointF(div2, h * 0.75))
+        else:
+            info_block = 0
+
+        # pesan prioritas
         if self.text_level >= 2:
             tcol = RED
         elif self.text_level == 1:
             tcol = AMBER
         else:
             tcol = GREEN
-        text_x = dx + S(18)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(tcol))
         p.drawEllipse(QPointF(text_x + S(4), cy), S(4), S(4))
 
         f = font(12, self.text_level > 0)
-        room = max(0, int(w - text_x - S(18) - S(24)))
+        room = max(0, int(w - text_x - S(18) - right_margin - info_block - S(6)))
         shown = QFontMetrics(f).elidedText(self.text, Qt.ElideRight, room)
         p.setPen(QColor(tcol if self.text_level > 0 else "#cbd5e1"))
         p.setFont(f)
@@ -2628,8 +2655,8 @@ class DashboardPage(QWidget):
         self.on_drive_mode_change(mode_key)
 
     def update_status_pills(self, d, drive_mode, soc):
-        levels, text, text_level = compute_telltales(d, drive_mode, soc)
-        self.status_bar.set_state(levels, text, text_level)
+        levels, text, text_level, info = compute_telltales(d, drive_mode, soc)
+        self.status_bar.set_state(levels, text, text_level, info)
 
     def render(self, d):
         speed = float(d["speed"])
