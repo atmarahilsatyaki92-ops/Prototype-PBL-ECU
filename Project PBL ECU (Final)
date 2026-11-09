@@ -61,6 +61,7 @@ DEMO_SPEEDUP = 25.0         # percepatan waktu simulator supaya perubahan terlih
 GREEN, AMBER, RED, CYAN, GRAY = "#22c55e", "#f59e0b", "#ef4444", "#38bdf8", "#94a3b8"
 MUTED = "#475569"
 SUBTLE = "#8b9ab3"          # teks keterangan (kontras lebih tinggi dari #64748b)
+DOOR_OPEN_DEG = 38.0        # sudut bukaan pintu pada gambar mobil (derajat)
 
 # --- Sensor oksigen wideband: AFR (rasio udara : bahan bakar, bensin) ---
 STOICH_AFR = 14.7                       # campuran ideal (lambda = 1.00)
@@ -1607,6 +1608,11 @@ class CarCenterViewDetailed(QWidget):
         self.temp = 32            # suhu baterai
         self.afr = None           # sensor oksigen (None = mesin mati)
         self.doors = [False, False, False, False]
+        self._door_ang = [0.0, 0.0, 0.0, 0.0]      # sudut yang digambar (dianimasikan)
+        self._door_tgt = [0.0, 0.0, 0.0, 0.0]      # sudut tujuan: 0 = tertutup
+        self._door_anim = QTimer(self)
+        self._door_anim.setInterval(16)
+        self._door_anim.timeout.connect(self._door_step)
         self.speed = 61.0
         self.current_tab = "Whole Car"
         self.car_pixmap, self.car_clean = load_car()
@@ -1630,7 +1636,24 @@ class CarCenterViewDetailed(QWidget):
         if afr != self.afr or doors != self.doors:
             self.afr = afr
             self.doors = list(doors)
+            self._door_tgt = [DOOR_OPEN_DEG if f else 0.0 for f in self.doors]
+            if not self._door_anim.isActive() and self._door_tgt != self._door_ang:
+                self._door_anim.start()
             self.update()
+
+    def _door_step(self):
+        """Animasi buka/tutup pintu (ease-out, selesai sekitar 0,25 detik)."""
+        moving = False
+        for i in range(4):
+            diff = self._door_tgt[i] - self._door_ang[i]
+            if abs(diff) < 0.4:
+                self._door_ang[i] = self._door_tgt[i]
+            else:
+                self._door_ang[i] += diff * 0.22
+                moving = True
+        if not moving:
+            self._door_anim.stop()
+        self.update()
 
     # ---------------- helpers ----------------
     def _car(self, max_w, max_h):
@@ -1761,47 +1784,92 @@ class CarCenterViewDetailed(QWidget):
 
     def _draw_open_doors(self, p, ix, iy, iw, ih, k):
         """
-        Pintu terbuka digambar seperti daun pintu yang terayun keluar (tampak atas):
-        satu lengkung tipis merah dari engsel, lintasan ayun putus-putus yang samar, dan titik engsel.
+        Pintu terbuka digambar sebagai daun pintu yang terayun keluar dari engsel (tampak atas):
+        badan pintu berwarna bodi mobil dengan gradasi, kaca gelap, gagang, bayangan lembut,
+        dan garis tepi merah tipis sebagai penanda. Sudutnya dianimasikan (_door_ang).
         """
-        theta = 40.0                                   # sudut bukaan pintu (derajat)
-        t = math.radians(theta)
         # (indeks pintu, sisi, posisi engsel relatif thd tinggi mobil [atas = depan], panjang daun relatif)
         specs = [(0, "L", 0.285, 0.19), (1, "R", 0.285, 0.19),
                  (2, "L", 0.520, 0.17), (3, "R", 0.520, 0.17)]
         for idx, side, hy_rel, len_rel in specs:
-            if not self.doors[idx]:
+            ang = self._door_ang[idx]
+            if ang < 0.5:
                 continue
             left = side == "L"
             hx = ix + iw * (0.085 if left else 0.915)
             hy = iy + ih * hy_rel
             L = ih * len_rel
-            sgn = -1.0 if left else 1.0
-            ex = hx + sgn * L * math.sin(t)
-            ey = hy + L * math.cos(t)
+            Wd = L * 0.26
+            fade = min(1.0, ang / 12.0)             # muncul halus di awal ayunan
 
-            # lintasan ayun (garis putus-putus tipis dan samar)
-            p.setPen(QPen(QColor(239, 68, 68, 110), 1.3 * k, Qt.DotLine))
+            def col(hexc, a=1.0):
+                c = QColor(hexc)
+                c.setAlpha(int(255 * fade * a))
+                return c
+
+            # lintasan ayun (garis putus-putus samar)
+            p.setPen(QPen(col(RED, 0.28), 1.2 * k, Qt.DotLine))
             p.setBrush(Qt.NoBrush)
-            p.drawArc(QRectF(hx - L, hy - L, 2 * L, 2 * L), int(270 * 16), int((-theta if left else theta) * 16))
+            p.drawArc(QRectF(hx - L, hy - L, 2 * L, 2 * L), int(270 * 16),
+                      int((-DOOR_OPEN_DEG if left else DOOR_OPEN_DEG) * 16))
 
-            # daun pintu: lengkung kuadratik tipis dengan sedikit cembung ke luar
-            ddx, ddy = ex - hx, ey - hy
-            nx, ny = (-ddy, ddx) if left else (ddy, -ddx)
-            norm = math.hypot(nx, ny) or 1.0
-            bulge = 0.10 * L
-            path = QPainterPath()
-            path.moveTo(hx, hy)
-            path.quadTo((hx + ex) / 2 + nx / norm * bulge, (hy + ey) / 2 + ny / norm * bulge, ex, ey)
-            p.setPen(QPen(QColor(239, 68, 68, 55), 7 * k, Qt.SolidLine, Qt.RoundCap))   # glow
-            p.drawPath(path)
-            p.setPen(QPen(QColor(RED), 2.4 * k, Qt.SolidLine, Qt.RoundCap))
-            p.drawPath(path)
+            p.save()
+            p.translate(hx, hy)
+            p.rotate(ang if left else -ang)         # + = searah jarum jam: pintu kiri membuka ke kiri
+
+            # sumbu lokal: daun memanjang ke +y dari engsel; sisi luar menghadap keluar mobil
+            x0, x1 = (-Wd, 0.0) if left else (0.0, Wd)
+            outer_x, inner_x = (x0, x1) if left else (x1, x0)
+            leaf = QRectF(x0, 0.0, Wd, L)
+            r = min(Wd * 0.45, 8 * k)
+
+            def xt(t):                               # t = 0 di sisi luar ... 1 di sisi dalam
+                return outer_x + (inner_x - outer_x) * t
+
+            # bayangan lembut di bawah daun pintu
+            sh = 3.5 * k
+            p.setPen(Qt.NoPen)
+            p.setBrush(col("#000000", 0.26))
+            p.drawRoundedRect(leaf.translated(0.8 * sh * (-1 if left else 1), sh), r, r)
+
+            # glow merah tipis di sekeliling daun
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(col(RED, 0.22), 6 * k))
+            p.drawRoundedRect(leaf, r, r)
+
+            # badan pintu: gradasi warna bodi (terang di sisi luar)
+            g = QLinearGradient(outer_x, 0, inner_x, 0)
+            g.setColorAt(0.0, col("#f3f6fb"))
+            g.setColorAt(1.0, col("#aab6cb"))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(g))
+            p.drawRoundedRect(leaf, r, r)
+
+            # kaca gelap
+            wa, wb = xt(0.20), xt(0.82)
+            win = QRectF(min(wa, wb), L * 0.12, abs(wb - wa), L * 0.50)
+            gw = QLinearGradient(0, win.top(), 0, win.bottom())
+            gw.setColorAt(0.0, col("#1a2333"))
+            gw.setColorAt(1.0, col("#33466b"))
+            p.setBrush(QBrush(gw))
+            p.drawRoundedRect(win, r * 0.6, r * 0.6)
+
+            # gagang pintu
+            hw = Wd * 0.34
+            hcx = xt(0.5)
+            p.setBrush(col("#7d8aa3"))
+            p.drawRoundedRect(QRectF(hcx - hw / 2, L * 0.72, hw, max(2 * k, L * 0.045)), k, k)
+
+            # garis tepi merah tipis
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(col(RED), 1.6 * k))
+            p.drawRoundedRect(leaf, r, r)
 
             # engsel
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(RED))
-            p.drawEllipse(QPointF(hx, hy), 2.4 * k, 2.4 * k)
+            p.setBrush(col(RED))
+            p.drawEllipse(QPointF(0, 0), 2.4 * k, 2.4 * k)
+            p.restore()
 
     # ---------- TAB: WHOLE CAR ----------
     def _paint_car(self, p, w, h, k):
@@ -1827,7 +1895,7 @@ class CarCenterViewDetailed(QWidget):
             p.drawRoundedRect(QRectF(ix, iy, iw, ih), 22, 22)
 
         # pintu terbuka: lengkung tipis di sisi mobil (atas = depan)
-        if any(self.doors):
+        if any(a > 0.5 for a in self._door_ang):
             self._draw_open_doors(p, ix, iy, iw, ih, k)
 
         # bar baterai (kiri) & suhu baterai (kanan)
