@@ -62,6 +62,10 @@ GREEN, AMBER, RED, CYAN, GRAY = "#22c55e", "#f59e0b", "#ef4444", "#38bdf8", "#94
 MUTED = "#475569"
 SUBTLE = "#8b9ab3"          # teks keterangan (kontras lebih tinggi dari #64748b)
 DOOR_OPEN_DEG = 38.0        # sudut bukaan pintu pada gambar mobil (derajat)
+SCAN_INTERVAL_S = 3.0       # jeda antar percobaan sambung ulang / pemindaian port
+STALE_S = 3.0               # tanpa paket valid selama ini = "TIDAK ADA DATA"
+AUTO_DETECT_LIVE = True     # mode DEMO otomatis pindah ke data asli jika STM32/CH340/CP210 dicolok
+DEMO_TOOLTIP = "Tombol uji (mode demo):\n1-4 = pintu FL/FR/RL/RR\nB = sabuk\nT = ban kempis\nO = campuran AFR\nQ / E = sein kiri / kanan\nH = hazard"
 
 # --- Sensor oksigen wideband: AFR (rasio udara : bahan bakar, bensin) ---
 STOICH_AFR = 14.7                       # campuran ideal (lambda = 1.00)
@@ -1799,7 +1803,7 @@ class CarCenterViewDetailed(QWidget):
             hx = ix + iw * (0.085 if left else 0.915)
             hy = iy + ih * hy_rel
             L = ih * len_rel
-            Wd = L * 0.26
+            Wd = L * 0.20
             fade = min(1.0, ang / 12.0)             # muncul halus di awal ayunan
 
             def col(hexc, a=1.0):
@@ -2069,7 +2073,7 @@ class CarCenterViewDetailed(QWidget):
 
         pix = self._car(box_w * 0.95, box_h * 0.97)
         if pix:
-            p.setOpacity(0.75)
+            p.setOpacity(0.92)
             p.drawPixmap(int(cx - pix.width() / 2), int(by + (box_h - pix.height()) / 2), pix)
             p.setOpacity(1.0)
 
@@ -2085,13 +2089,16 @@ class CarCenterViewDetailed(QWidget):
         ]
 
         all_ok = True
+        bad_tires = []
         for wx, wy, label, psi in wheels:
             if 30 <= psi <= 40:
                 col, bg = GREEN, "#062016"
             elif 25 <= psi <= 45:
                 col, bg, all_ok = AMBER, "#2a1a04", False
+                bad_tires.append((label, psi))
             else:
                 col, bg, all_ok = RED, "#2a0a0a", False
+                bad_tires.append((label, psi))
 
             p.setPen(QPen(QColor(col), 1.6))
             p.setBrush(QColor(bg))
@@ -2107,10 +2114,11 @@ class CarCenterViewDetailed(QWidget):
             p.setFont(rfont(max(10 * k, bw * 0.16), True))
             p.drawText(QRectF(wx, wy + bh * 0.72, bw, bh * 0.20), Qt.AlignCenter, "PSI")
 
-        p.setPen(QColor(GREEN if all_ok else AMBER))
+        critical = any(v < 25 or v > 45 for _, v in bad_tires)
+        p.setPen(QColor(GREEN if all_ok else (RED if critical else AMBER)))
         p.setFont(font(12, True))
         msg = ("Semua roda dalam tekanan ideal (30-40 PSI)" if all_ok
-               else "Periksa ban yang berwarna kuning / merah")
+               else "Periksa ban " + ", ".join(f"{n} ({v} PSI)" for n, v in bad_tires))
         p.drawText(QRectF(0, h - margin - status_h, w, status_h), Qt.AlignCenter, msg)
 
 
@@ -2810,10 +2818,20 @@ class EVDashboardMain(QMainWindow):
         )
         self.resize(win_w, win_h)
 
+        # --- koneksi serial: tahan banting (baris rusak dilewati, sambung ulang, deteksi data basi) ---
+        self.port_arg = port                  # port yang diminta eksplisit (None = otomatis)
         self.ser = None
-        self.port_name = None
-        self.init_serial(port)
-        self.demo = self.ser is None
+        self.port_name = port
+        self.mode = "demo"                    # "demo" | "live"
+        self.last_rx = None                   # waktu paket valid terakhir
+        self.opened_at = 0.0
+        self.bad_lines = 0
+        self._rx_buf = bytearray()
+        self._next_scan = 0.0
+        if self._try_open_serial():
+            self.mode = "live"
+        elif port and serial is not None:     # port diminta eksplisit: tunggu / ulangi, jangan jatuh ke demo
+            self.mode = "live"
 
         self.raw = dict(DEFAULT_RAW)
         self.sim = Simulator()
@@ -2840,35 +2858,82 @@ class EVDashboardMain(QMainWindow):
         self.clock_timer.start()
         self.update_clock()
 
-    def init_serial(self, port=None):
-        if serial is None:
-            return
-        if port is None:
+    @property
+    def demo(self):
+        return self.mode == "demo"
+
+    def _find_port(self):
+        if self.port_arg:
+            return self.port_arg
+        if list_ports is None:
+            return None
+        try:
             for p in list_ports.comports():
                 text = f"{p.description} {p.manufacturer or ''}"
                 if any(k in text for k in ["STM", "CH340", "CP210"]):
-                    port = p.device
-                    break
-        if port is None:
-            return
-        try:
-            self.ser = serial.Serial(port, BAUDRATE, timeout=0.05)
-            self.port_name = port
+                    return p.device
         except Exception:
             pass
+        return None
 
-    def read_serial(self):
-        packet = None
+    def _try_open_serial(self):
+        """Coba buka port. Return True jika berhasil."""
+        if serial is None:
+            return False
+        port = self._find_port()
+        if port is None:
+            return False
         try:
-            while self.ser and self.ser.in_waiting:
-                line = self.ser.readline().decode("utf-8", errors="ignore").strip()
-                if line:
-                    obj = json.loads(line)
-                    if isinstance(obj, dict):
-                        packet = obj
+            self.ser = serial.Serial(port, BAUDRATE, timeout=0.05)
         except Exception:
             self.ser = None
-        return packet
+            return False
+        self.port_name = port
+        self.opened_at = time.monotonic()
+        self.last_rx = None
+        self._rx_buf.clear()
+        return True
+
+    def _close_serial(self):
+        try:
+            if self.ser:
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+        self._rx_buf.clear()
+        self._next_scan = time.monotonic() + SCAN_INTERVAL_S      # beri jeda sebelum mencoba lagi
+
+    def read_serial(self):
+        """
+        Baca semua byte yang tersedia dan pecah per baris. Baris yang rusak/terpotong dilewati
+        (koneksi tetap hidup). Return gabungan paket valid (None jika tidak ada).
+        """
+        packet = {}
+        try:
+            n = self.ser.in_waiting if self.ser else 0
+            if n:
+                self._rx_buf.extend(self.ser.read(n))
+                if len(self._rx_buf) > 16384:              # tanpa newline sama sekali = sampah
+                    self._rx_buf.clear()
+                *lines, rest = bytes(self._rx_buf).split(b"\n")
+                self._rx_buf = bytearray(rest)
+                for chunk in lines:
+                    line = chunk.decode("utf-8", errors="ignore").strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        self.bad_lines += 1
+                        continue
+                    if isinstance(obj, dict):
+                        packet.update(obj)
+                    else:
+                        self.bad_lines += 1
+        except Exception:
+            self._close_serial()                          # port benar-benar hilang (kabel dicabut, dll.)
+        return packet or None
 
     def on_login_success(self, user_info):
         self.page_dash.lbl_user.setText(user_info)
@@ -2910,28 +2975,52 @@ class EVDashboardMain(QMainWindow):
         super().keyPressEvent(event)
 
     def _conn_info(self):
-        if self.demo:
+        if self.mode == "demo":
             return "DEMO • SIMULATOR", AMBER
-        if self.ser:
-            return f"{self.port_name} • {BAUDRATE}", GREEN
-        return "TERPUTUS", RED
+        now = time.monotonic()
+        if self.ser is None:
+            return "MENCARI PORT…", AMBER
+        if self.last_rx is None:
+            if now - self.opened_at < STALE_S:
+                return "MENUNGGU DATA…", AMBER
+            return "TIDAK ADA DATA", RED
+        if now - self.last_rx > STALE_S:
+            return "TIDAK ADA DATA", RED
+        return f"{self.port_name} • {BAUDRATE}", GREEN
 
     def update_clock(self):
         now = datetime.datetime.now()
         time_12h = now.strftime("%I:%M %p").lstrip('0')
         self.page_dash.set_big_clock(time_12h)
         self.page_dash.set_connection(*self._conn_info())
-        self.page_dash.lbl_conn.setToolTip(
-            "Tombol uji (mode demo):\n1-4 = pintu FL/FR/RL/RR\nB = sabuk\nT = ban kempis\nO = campuran AFR\nQ / E = sein kiri / kanan\nH = hazard"
-            if self.demo else "")
+        if self.demo:
+            tip = DEMO_TOOLTIP
+        else:
+            tip = f"Port: {self.port_name or 'otomatis'}\nBaris rusak dilewati: {self.bad_lines}"
+        self.page_dash.lbl_conn.setToolTip(tip)
 
     def update_telemetry(self):
-        if self.demo:
+        now = time.monotonic()
+        if self.mode == "demo":
             self.raw.update(self.sim.step())
-        elif self.ser:
-            packet = self.read_serial()
-            if packet:
-                self.raw.update(packet)
+            # kabel STM32 dicolok saat program berjalan -> pindah ke data asli
+            if AUTO_DETECT_LIVE and self.port_arg is None and now >= self._next_scan:
+                self._next_scan = now + SCAN_INTERVAL_S
+                if self._try_open_serial():
+                    keep = self.raw.get("drive_mode", "ICE")
+                    self.raw = dict(DEFAULT_RAW)          # buang data simulasi
+                    self.raw["drive_mode"] = keep
+                    self.mode = "live"
+        else:
+            if self.ser is None:
+                if now >= self._next_scan:                # sambung ulang berkala
+                    self._next_scan = now + SCAN_INTERVAL_S
+                    self._try_open_serial()
+            else:
+                packet = self.read_serial()
+                if packet:
+                    self.raw.update(packet)
+                    self.last_rx = now
 
         if self.stack.currentWidget() == self.page_dash:
             self.page_dash.render(build_view(self.raw))
